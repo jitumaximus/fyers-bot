@@ -1,0 +1,19 @@
+# secrets
+.env
+.env.*
+!.env.example
+token.json
+# environments / caches
+venv/
+.venv/
+__pycache__/
+*.pyc
+# runtime output
+*.log
+state*.json
+events.jsonl
+trades*.csv
+data/
+# leftovers
+*.bak
+*.save

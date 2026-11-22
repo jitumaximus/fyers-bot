@@ -1,0 +1,15 @@
+[Unit]
+Description=Fyers NSE futures bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/fyers_bot
+Environment=TZ=Asia/Kolkata
+ExecStart=/home/ubuntu/fyers_bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
