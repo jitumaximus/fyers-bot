@@ -80,9 +80,10 @@ def long_trigger(df15_closed: pd.DataFrame, today):
 
 def _div_trigger(df_closed, today, side, window_min):
     """RSI divergence on closed candles of today (see config.RSI_ENTRY). The last closed candle is the divergence
-    candidate. First peak (short) = any candle closing above EMA5 with its low above it; first dip (long) = any candle
-    with its high below EMA5. Among those within window_min and at least RSI_DIV_MIN_GAP candles before the
-    candidate (that many candles in between), the highest peak / lowest dip is the reference."""
+    candidate. First peak (short) = RED candle closing above EMA5 with its low above it; first dip (long) = GREEN
+    candle with its high below EMA5. Among those within window_min and at least RSI_DIV_MIN_GAP candles before the
+    candidate (that many candles in between), the highest peak / lowest dip is the reference. The RSI must differ by
+    at least RSI_DIV_MIN_RSI_DIFF (short: peak - divergence, long: divergence - dip)."""
     if len(df_closed) < max(config.EMA_PERIOD, config.RSI_PERIOD) + 3:
         return None
     df = df_closed
@@ -93,9 +94,9 @@ def _div_trigger(df_closed, today, side, window_min):
     if d["ts"].date() != today:
         return None
     if side == "SHORT":
-        is_ref = (df["close"] > e) & (df["low"] > e)
+        is_ref = (df["close"] < df["open"]) & (df["close"] > e) & (df["low"] > e)
     else:
-        is_ref = df["high"] < e
+        is_ref = (df["close"] > df["open"]) & (df["high"] < e)
     ref = None
     for k in range(n - 1 - config.RSI_DIV_MIN_GAP, -1, -1):
         if df["ts"].iloc[k].date() != today or df["ts"].iloc[k].time() < config.ENTRY_START:
@@ -108,19 +109,24 @@ def _div_trigger(df_closed, today, side, window_min):
     if ref is None:
         return None
     p = df.iloc[ref]
+    min_diff = config.RSI_DIV_MIN_RSI_DIFF
     if side == "SHORT":
-        ok = d["close"] < d["open"] and d["high"] > p["high"] and r[n] < r[ref]
+        diff = r[ref] - r[n]
+        ok = d["close"] < d["open"] and d["high"] > p["high"] and diff >= min_diff
         if not ok:
             return None
         return {"side": "SHORT", "stop_ref": float(d["high"]), "trigger_ts": d["ts"], "entry_below": float(d["open"]),
-                "detail": f"peak {p['ts']:%H:%M} high {p['high']} RSI {r[ref]:.1f} (above EMA5, {n - ref - 1} candles between); "
-                          f"red {d['ts']:%H:%M} high {d['high']} RSI {r[n]:.1f} -> bearish divergence"}
-    ok = d["close"] > d["open"] and d["low"] < p["low"] and r[n] > r[ref]
+                "detail": f"red peak {p['ts']:%H:%M} high {p['high']} RSI {r[ref]:.1f} (above EMA5, {n - ref - 1} candles between); "
+                          f"red {d['ts']:%H:%M} high {d['high']} RSI {r[n]:.1f}; RSI diff {diff:.1f} (>= {min_diff:g}) "
+                          f"-> bearish divergence"}
+    diff = r[n] - r[ref]
+    ok = d["close"] > d["open"] and d["low"] < p["low"] and diff >= min_diff
     if not ok:
         return None
     return {"side": "LONG", "stop_ref": float(d["low"]), "trigger_ts": d["ts"], "entry_above": float(d["open"]),
-            "detail": f"dip {p['ts']:%H:%M} low {p['low']} RSI {r[ref]:.1f} (high < EMA5, {n - ref - 1} candles between); "
-                      f"green {d['ts']:%H:%M} low {d['low']} RSI {r[n]:.1f} -> bullish divergence"}
+            "detail": f"green dip {p['ts']:%H:%M} low {p['low']} RSI {r[ref]:.1f} (high < EMA5, {n - ref - 1} candles between); "
+                      f"green {d['ts']:%H:%M} low {d['low']} RSI {r[n]:.1f}; RSI diff {diff:.1f} (>= {min_diff:g}) "
+                      f"-> bullish divergence"}
 
 
 def short_div_trigger(df5_closed, today):
@@ -247,6 +253,24 @@ def breakout_trigger(rng, candle_open, ltp):
         return {"side": "LONG", "stop_ref": rng["wick_low"], "detail": f"BREAKOUT {span}; 15m open {candle_open}, LTP {ltp}"}
     if ltp < candle_open and ltp < rng["low"]:
         return {"side": "SHORT", "stop_ref": rng["wick_high"], "detail": f"BREAKDOWN {span}; 15m open {candle_open}, LTP {ltp}"}
+    return None
+
+
+def open_breakout_trigger(rng, c5_open, c5_high, c5_low, ltp):
+    """09:19:30 opening check (config.BREAKOUT_OPEN_CHECK) on the first 5m candle (09:15-09:20) as it stands.
+    Breakout : LTP above the range's body high and the 5m candle green so far -> LONG, stop 1 tick below its low.
+    Breakdown: LTP below the range's body low and the 5m candle red so far   -> SHORT, stop 1 tick above its high.
+    (levels() adds the tick and the OPEN_BO_MIN_STOP_PCT minimum.)"""
+    if not (rng and ltp and c5_open):
+        return None
+    span = f"1H range {rng['low']}-{rng['high']} ({rng['pct'] * 100:.2f}%, bodies)"
+    c5 = f"09:15 5m O {c5_open} H {c5_high} L {c5_low}"
+    if ltp > c5_open and ltp > rng["high"]:
+        return {"side": "LONG", "stop_ref": min(c5_low, ltp), "open_5m": True,
+                "detail": f"OPEN 5m BREAKOUT {span}; {c5}, LTP {ltp}; stop below the 5m low"}
+    if ltp < c5_open and ltp < rng["low"]:
+        return {"side": "SHORT", "stop_ref": max(c5_high, ltp), "open_5m": True,
+                "detail": f"OPEN 5m BREAKDOWN {span}; {c5}, LTP {ltp}; stop above the 5m high"}
     return None
 
 

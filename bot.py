@@ -4,7 +4,7 @@ Squares off at 15:15."""
 import logging
 import time
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 
 import config
 import strategy
@@ -15,6 +15,9 @@ from trader import BOOKS, Trader, label, log_signal
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s",
                     handlers=[logging.FileHandler(config.DATA_DIR / "bot.log"), logging.StreamHandler()])
 log = logging.getLogger("bot")
+
+
+OPEN_CANDLE_END = dtime(9, 20)   # end of the first 5m candle (the OPEN 5m check must run before it)
 
 
 def floor_to(dt, minutes):
@@ -31,6 +34,7 @@ class Bot:
         self.arms = {}                 # symbol -> {"side", "rsi", "candle"}   (2H RSI)
         self.ranges = {}               # symbol -> {"high", "low", "pct", ...}  (1H consolidation)
         self.last_bo = None            # 15m candle already checked for breakouts
+        self.open_bo_day = None        # day the 09:19:30 OPEN 5m breakout check ran (or was missed)
         self.next_arm_refresh = None   # None = refresh as soon as possible
         self.last_seen = {}            # (symbol, side) -> trigger candle already evaluated
         self.last5 = self.last15 = None
@@ -50,7 +54,8 @@ class Bot:
             return True
         open_check = now.replace(hour=config.MARKET_OPEN.hour, minute=config.MARKET_OPEN.minute + 1,
                                  second=0, microsecond=0)
-        if now < open_check or not self.universe or time.time() - self.last_live_check < 300:
+        retry = 20 if now.time() < OPEN_CANDLE_END else 300   # don't miss the 09:19:30 OPEN 5m check
+        if now < open_check or not self.universe or time.time() - self.last_live_check < retry:
             return False
         self.last_live_check = time.time()
         ref = next((s for s, v in self.universe.items() if v["underlying"] == "RELIANCE"), next(iter(self.universe)))
@@ -224,9 +229,44 @@ class Bot:
             if sig and self.trader.can_enter(book):
                 self.try_enter(now, sym, sig, book, sig["detail"])
 
+    def check_open_breakouts(self, now):
+        """Once a day at 09:19:30 (config.BREAKOUT_OPEN_CHECK): 1H ranges (yesterday's last 3 closed 1H candles) broken
+        at the open, with the first 5m candle green (breakout) / red (breakdown) so far. Ignores ENTRY_START."""
+        if not self.ranges:
+            log.info("OPEN 5m check: no 1H ranges")
+            return
+        prices = self.client.ltp(list(self.ranges))
+
+        def strength(s):
+            p, r = prices.get(s) or 0, self.ranges[s]
+            return p / r["high"] if p > r["high"] else (r["low"] / p if 0 < p < r["low"] else 0)
+        outside = sorted((s for s in self.ranges if strength(s) > 1), key=strength, reverse=True)
+        log.info("OPEN 5m check: %d of %d 1H ranges broken at the open", len(outside), len(self.ranges))
+        first = now.replace(hour=config.MARKET_OPEN.hour, minute=config.MARKET_OPEN.minute, second=0, microsecond=0)
+        for sym in outside:
+            self.tick()
+            if now_ist().time() >= OPEN_CANDLE_END:
+                log_signal(now_ist(), sym, "OPEN 5m", "check ran past 09:20", "stopped: first 5m candle closed")
+                return
+            if not (self.trader.can_enter("1H BREAKOUT") or self.trader.can_enter("1H BREAKDOWN")):
+                return
+            if not self.trader.can_enter("1H BREAKOUT" if (prices.get(sym) or 0) > self.ranges[sym]["high"] else "1H BREAKDOWN"):
+                continue
+            df5 = self.client.history(sym, config.SHORT_TF, days=1)
+            row = df5[df5["ts"] == first] if not df5.empty else df5
+            if row.empty:
+                continue
+            ltp = self.client.ltp([sym]).get(sym)
+            c = row.iloc[0]
+            sig = strategy.open_breakout_trigger(self.ranges[sym], float(c["open"]), float(c["high"]), float(c["low"]), ltp)
+            book = "1H BREAKOUT" if sig and sig["side"] == "LONG" else "1H BREAKDOWN"
+            if sig and self.trader.can_enter(book):
+                self.try_enter(now_ist(), sym, sig, book, sig["detail"])
+
     def try_enter(self, now, sym, sig, strat, setup):
         info, side = self.universe[sym], sig["side"]
-        kind = f"TRIGGER {strat}"
+        opening = sig.get("open_5m", False)          # 09:19:30 OPEN 5m breakout / breakdown
+        kind = f"TRIGGER {strat}" + (" OPEN 5m" if opening else "")
         try:
             buy, sell = self.client.depth_totals(sym)
             ok, share = strategy.imbalance_ok(side, buy, sell)   # order book of the scanned symbol
@@ -282,19 +322,25 @@ class Bot:
                                                       max(float(d5["high"].max()), ltp), min(float(d5["low"].min()), ltp))
         except Exception as e:
             log.warning("open/extreme check %s: %s", sym, e)
-        if config.RSI_ALWAYS_TRAIL and strat.startswith("2H RSI"):
+        if (config.RSI_ALWAYS_TRAIL and strat.startswith("2H RSI")) or opening:
             trail, gap = True, None
             setup = f"{setup} | trailing, no target"
         if gap is not None:
             setup = (f"{setup} | open {'≈ high' if side == 'SHORT' else '≈ low'} ({gap * 100:.2f}%) → trailing, no target"
                      if trail else f"{setup} | open vs day {'high' if side == 'SHORT' else 'low'} {gap * 100:.2f}% → 2R target")
         max_loss = config.MAX_LOSS_PCT * balance
-        min_stop = config.SHORT_MIN_STOP_PCT if strat == "2H RSI SHORT" else \
+        min_stop = config.OPEN_BO_MIN_STOP_PCT if opening else config.SHORT_MIN_STOP_PCT if strat == "2H RSI SHORT" else \
             config.LONG_MIN_STOP_PCT if strat == "2H RSI LONG" else 0.0
         lv = strategy.levels(side, ltp, sig["stop_ref"], max_loss, qty, info["tick"], trail, min_stop) if ltp else None
         if not lv:
             log_signal(now, sym, kind, setup, f"skipped: price {ltp} already past stop level")
             return
+        if opening and lv["stop_basis"] != "candle":
+            candle_stop = sig["stop_ref"] + (info["tick"] if side == "SHORT" else -info["tick"])
+            setup = (f"{setup} | 5m stop {candle_stop:g} ({abs(candle_stop - ltp) / ltp * 100:.2f}%) "
+                     + (f"widened to {config.OPEN_BO_MIN_STOP_PCT:.1%}" if lv["stop_basis"].startswith("min")
+                        else "capped at 10% capital") + f" -> SL {lv['stop']}")
+            log.info("OPEN 5m %s: %s", sym, setup.rsplit(" | ", 1)[-1])
         log_signal(now, sym, kind, setup, f"ENTER {fut} @ {fut_ltp} | {config.PRICE_LABEL.lower()} {ltp} SL {lv['stop']} "
                                           f"TP {lv['target'] if lv['target'] is not None else 'trail'}")
         try:
@@ -365,6 +411,14 @@ class Bot:
             self.last15 = b15
             if in_window and self.trader.can_enter("2H RSI LONG"):
                 self.check_triggers(now, "LONG")
+
+        if self.open_bo_day != today and t >= config.BREAKOUT_OPEN_CHECK:
+            self.open_bo_day = today                  # once a day, even if it fails
+            if t < OPEN_CANDLE_END:
+                if self.trader.can_enter("1H BREAKOUT") or self.trader.can_enter("1H BREAKDOWN"):
+                    self.check_open_breakouts(now)
+            else:
+                log.info("OPEN 5m check skipped: first reached at %s, after the first 5m candle", t.strftime("%H:%M:%S"))
 
         bo_time = b15 + timedelta(minutes=config.BREAKOUT_CHECK_MINUTE)
         if b15 != self.last_bo and bo_time <= now < b15 + timedelta(minutes=15):

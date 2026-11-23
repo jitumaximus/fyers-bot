@@ -41,16 +41,19 @@ RSI_OVERBOUGHT = 70     # closed 2H RSI above this arms SHORT (85 from 13-19 Nov
 SHORT_MIN_STOP_PCT = 0.005  # 2H RSI SHORT: stop at least 0.5% from entry
 LONG_MIN_STOP_PCT = 0.005   # 2H RSI LONG: stop at least 0.5% from entry
 # 2H RSI entry rule: "divergence" (since 19 Nov 2026) or "classic" (A green above EMA5 + B red / C1-C2).
-# Divergence SHORT (5m): first peak = candle (any colour) closing above EMA5 with its low above EMA5; within the next
-#   RSI_DIV_SHORT_WINDOW_MIN a RED candle closes with a higher high and a lower RSI(14, 5m) -> short at the next
-#   candle's open (if it opens below that red candle's body high); stop above the red candle's high.
-# Divergence LONG (15m): first trough = candle with its high below EMA5; within RSI_DIV_LONG_WINDOW_MIN a GREEN candle
-#   closes with a lower low and a higher RSI(14, 15m) -> long at the next open (if above its body low); stop below its low.
+# Divergence SHORT (5m): first peak = RED candle closing above EMA5 with its low above EMA5; within the next
+#   RSI_DIV_SHORT_WINDOW_MIN a RED candle closes with a higher high and an RSI(14, 5m) at least RSI_DIV_MIN_RSI_DIFF
+#   lower -> short at the next candle's open (if it opens below that red candle's body high); stop above its high.
+# Divergence LONG (15m): first trough = GREEN candle with its high below EMA5; within RSI_DIV_LONG_WINDOW_MIN a GREEN
+#   candle closes with a lower low and an RSI(14, 15m) at least RSI_DIV_MIN_RSI_DIFF higher -> long at the next open
+#   (if above its body low); stop below its low.
 RSI_ENTRY = "divergence"
 RSI_DIV_SHORT_WINDOW_MIN = 45     # (30 until 20 Nov)
 RSI_DIV_LONG_WINDOW_MIN = 120     # (75 until 20 Nov)
 RSI_DIV_MIN_GAP = 2               # at least this many candles between the first and the second peak / dip
-# First peak/dip may be any colour (20 Nov); the reference is the highest peak / lowest dip in the window.
+# The reference is the highest peak / lowest dip in the window. Since 23 Nov the first peak must be red (short) and
+# the first dip green (long) (20-23 Nov: any colour).
+RSI_DIV_MIN_RSI_DIFF = 3.0        # divergence counts only if the RSI differs by at least this many points (23 Nov)
 RSI_ALWAYS_TRAIL = True     # 2H RSI trades: no fixed target, breakeven at 1R, trail from TRAIL_START_R (1H unchanged)
 SHORT_COOLDOWN_MIN = 30 # 2H RSI SHORT: no new short on a stock until 30 min after its last short closed
 RSI_OVERSOLD = 30       # closed 2H RSI below this arms LONG
@@ -61,6 +64,14 @@ BREAKOUT_TF = 60          # 1H consolidation candles
 BREAKOUT_CANDLES = 3      # last 3 closed 1H candles of TODAY only...
 BREAKOUT_RANGE_PCT = 0.01 # ...whose high-low range is within 1% of the low
 BREAKOUT_CHECK_MINUTE = 12  # check the forming 15m candle at its 12th minute
+# Opening check (23 Nov), once a day at 09:19:30, 4.5 min into the first 5m candle (09:15-09:20), before ENTRY_START:
+# same 1H range (at the open: yesterday's last 3 closed 1H candles). Breakout: LTP > body high and the first 5m candle
+# green so far (LTP > its open) -> LONG, stop 1 tick below that 5m candle's low (as of the check). Breakdown: LTP < body
+# low and the 5m candle red so far -> SHORT, stop 1 tick above its high. The stop is fixed at entry, widened to at
+# least OPEN_BO_MIN_STOP_PCT of the price (logged), still capped at MAX_LOSS_PCT. No 2R target: breakeven at 1R, trail
+# from TRAIL_START_R. Same books and limits as the minute-12 check. Logged as "OPEN 5m".
+BREAKOUT_OPEN_CHECK = time(9, 19, 30)
+OPEN_BO_MIN_STOP_PCT = 0.003
 IMBALANCE_MIN_SHARE = 0.55  # order book: longs need bids >= 55% of total book qty, shorts need asks >= 55%
 # The filter was never backtested (no historical order books) and blocked nearly every signal, so it is OFF:
 # the bid/ask share is still looked up and written into each signal/entry log for later analysis.
