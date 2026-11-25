@@ -116,5 +116,53 @@ class Helpers(unittest.TestCase):
         self.assertLess(pct, 0)                                                      # better than reference
 
 
+class Exits(unittest.TestCase):
+    """Limit exits (26 Nov 2026): long exits sell into the bids; floor = reference - cap."""
+    def test_needs_limit_only_when_market_slips_more_than_cap(self):
+        deep = book(bids=[(100.0, 1000)])
+        thin = book(bids=[(100.0, 50), (99.8, 1000)])
+        self.assertFalse(X.exit_needs_limit(deep, "LONG", 500, 0.001))
+        self.assertTrue(X.exit_needs_limit(thin, "LONG", 500, 0.001))     # avg 99.82 -> 0.18%
+        self.assertTrue(X.exit_needs_limit(book(bids=[(100.0, 10)]), "LONG", 500, 0.001))   # book can't fill it
+        self.assertTrue(X.exit_needs_limit(book(asks=[(100.0, 50), (100.2, 999)]), "SHORT", 500, 0.001))
+
+    def test_steps_rest_market_and_summary(self):
+        p = X.start_exit("LONG", 300, 0.05, 100.0, 0.001, 95.0, "TRAIL STOP", "trail")
+        self.assertEqual(p["floor"], 99.9)
+        b = book(bids=[(100.0, 100), (99.95, 50), (99.5, 1000)])
+        X.exit_steps(p, Fixed(b), 50, 0.05, b)
+        self.assertEqual((p["lim_qty"], p["left"]), (150, 150))           # 100 @ 100, 50 @ 99.95; 99.5 < floor
+        self.assertEqual(X.exit_rest(p, book(bids=[(99.85, 999)]), 50), 0)  # below the floor: waits
+        self.assertEqual(X.exit_rest(p, book(bids=[(99.9, 60), (99.8, 999)]), 50), 50)   # whole units only
+        self.assertFalse(X.guard_crossed("LONG", 95.01, 95.0))
+        self.assertTrue(X.guard_crossed("LONG", 95.0, 95.0))
+        self.assertTrue(X.guard_crossed("SHORT", 95.0, 94.9))
+        X.exit_market(p, book(bids=[(95.0, 60), (94.9, 999)]), "price back to entry + 0.5R")
+        self.assertTrue(X.exit_done(p))
+        ex = X.exit_summary(p)
+        self.assertEqual((ex["exit_type"], ex["exit_limit_qty"], ex["exit_market_qty"]), ("limit+market", 200, 100))
+        avg = (100 * 100 + 50 * 99.95 + 50 * 99.9 + 60 * 95 + 40 * 94.9) / 300
+        self.assertAlmostEqual(ex["exit_avg"], avg)
+        self.assertAlmostEqual(ex["exit_slip_pct"], round((100 - avg) / 100 * 100, 4))
+        self.assertIn("Exit: limit 200 + market 100 (price back to entry + 0.5R", X.exit_text(ex))
+
+    def test_market_rest_beyond_visible_book_is_estimated(self):
+        p = X.start_exit("SHORT", 100, 0.01, 10.0, 0.001, 9.0, "TRAIL STOP", "trail")
+        self.assertEqual(p["floor"], 10.01)
+        X.exit_market(p, book(asks=[(10.5, 40)]), "x")
+        ex = X.exit_summary(p)
+        self.assertEqual((ex["exit_type"], ex["exit_avg"]), ("market", 10.5))
+        self.assertIn("book too thin", ex["exit_estimated"])
+
+    def test_texts(self):
+        self.assertEqual(X.exit_text({"exit_type": "market", "exit_ref": 100, "exit_slip_pct": 0.05,
+                                      "exit_estimated": "yes"}),
+                         "Exit: market, slippage +0.050% vs 100 (estimated on the live book)")
+        t = X.entry_text({"entry_avg": 1.0002, "entry_ref": 1.0, "entry_children": 2, "qty_filled": 7853,
+                          "qty_intended": 7853, "entry_slip_pct": 0.02, "liq_capped": "yes", "qty_risk": 40637})
+        self.assertEqual(t, "Entry: limit, 2 order(s), filled 7853/7853 @ avg 1.0002 vs best 1, slippage +0.020%, "
+                            "size cut by liquidity to 7853 of 40637")
+
+
 if __name__ == "__main__":
     unittest.main()

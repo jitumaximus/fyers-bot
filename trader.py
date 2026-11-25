@@ -3,7 +3,8 @@
 Four independent books, one per strategy (2H RSI SHORT, 2H RSI LONG, 1H BREAKOUT, 1H BREAKDOWN). Each book has its own
 capital (STARTING_CAPITAL each), its own balance, one position at a time, its own daily loss limit and its own
 results. Levels (stop, target, breakeven) are on the price named by config.PRICE_LABEL (the future itself in
-FUTURES mode); entry and exit orders go to the future at market. P&L is the future's P&L."""
+FUTURES mode); orders go to the future (entries: capped IOC limits; exits: market, or limit for big trail-stop exits and
+the 15:10 square-off, see config / execution.py). P&L is the future's P&L."""
 import csv
 import json
 import logging
@@ -48,7 +49,10 @@ TRADE_COLS = ["mode", "strategy", "spot", "future", "side", "qty", "entry_time",
               # slip_pct / slip_inr: positive = worse than the reference price; qty in shares
               "entry_ref", "entry_avg", "entry_slip_pct", "entry_slip_inr", "entry_children", "qty_intended",
               "qty_filled", "liq_capped", "exit_ref", "exit_avg", "exit_slip_pct", "exit_slip_inr", "exit_children",
-              "exit_estimated"]
+              "exit_estimated",
+              # 26 Nov 2026: market / limit / limit+market (limit exits: trail stops whose market order would slip
+              # > EXIT_SLIP_CAP_PCT, and the 15:10 square-off)
+              "exit_type"]
 
 
 def log_signal(ts, symbol, kind, detail, action):
@@ -93,6 +97,8 @@ class Trader:
         self.client = client
         self.notify = notify
         self.paper = config.PAPER_MODE
+        self.sleep = time.sleep        # between exit child orders; the bot sets its own (keeps monitoring)
+        self._busy = set()             # books whose exit child orders are running right now
         old = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
         if "books" in old:
             self.state = old
@@ -159,7 +165,7 @@ class Trader:
         return any(p["future"] == future for b, p in self.positions() if b != name)
 
     # ---------- entry ----------
-    def open(self, name, spot, future, side, qty, spot_entry, fut_ref, lv, margin, setup, fut_tick, fill=None):
+    def open(self, name, spot, future, side, qty, spot_entry, fut_ref, lv, margin, setup, fut_tick, fill=None, lot=None):
         """name: the book (= strategy). spot_entry: price the levels were built from. fut_ref: future LTP.
         fill: the capped IOC entry already done by the bot (execution.run_entry; qty = what filled): no entry order
         is sent here and fut_ref is its average fill. Without it (old path), a market order in live mode."""
@@ -185,7 +191,7 @@ class Trader:
             "trail": lv.get("trail", False), "risk": lv["risk_per_unit"], "trail_r": None, "tick": fut_tick,
             "fut_entry": fut_entry, "margin": margin, "entry_time": datetime.now(IST).isoformat(timespec="seconds"),
             "setup": setup, "entry_id": entry_id, "backup_id": backup_id, "backup_stop": backup_stop,
-            "exit_error": None, "exec": fill or {}}
+            "exit_error": None, "exec": fill or {}, "lot": lot or qty, "pending": None}
         bk["day_trades"] += 1
         self.save()
         risk = abs(spot_entry - lv["stop"]) * qty
@@ -199,7 +205,9 @@ class Trader:
                     + (f"; from {config.TRAIL_START_R}R it trails {config.TRAIL_GAP_R}R behind in whole-R steps\n"
                        if lv.get("trail") else "\n") +
                     f"Risk ≈ ₹{risk:,.0f} | Margin ₹{margin:,.0f} | {label(name)} balance ₹{bk['balance']:,.0f}"
-                    + (f"\nBackup stop on future: {backup_stop}" if backup_stop else "") + f"\n{setup}")
+                    + (f"\nBackup stop on future: {backup_stop}" if backup_stop else "") + f"\n{setup}"
+                    + (f"\n{execution.entry_text(fill)}" if fill else ""))
+        log.info("ENTRY [%s] %s %s %s @ %s | %s", name, side, qty, future, fut_entry, execution.entry_text(fill) or "market")
 
     def _wait_fill(self, order_id, timeout=15):
         end = time.time() + timeout
@@ -222,6 +230,8 @@ class Trader:
         q = self.client.ltp(syms)
         self.write_live_prices(q)
         for name, p in open_:
+            if name in self._busy:
+                continue        # its exit child orders are running (we are inside their sleep)
             self.check(name, q.get(p["spot"]), q.get(p["future"]))
 
     def write_live_prices(self, q):
@@ -253,10 +263,15 @@ class Trader:
                 return
         if spot_ltp is None:
             return
+        if p.get("pending"):
+            self._step_exit(name, spot_ltp)
+            return
         long_ = p["side"] == "LONG"
         if (long_ and spot_ltp <= p["stop"]) or (not long_ and spot_ltp >= p["stop"]):
             why = f"TRAIL STOP ({p['trail_r'] - config.TRAIL_GAP_R}R)" if p.get("trail_r") else \
                 "BREAKEVEN STOP" if p["at_breakeven"] else "STOP"
+            if p.get("trail_r") and self.paper and self._start_limit_exit(name, why, spot_ltp, kind="trail"):
+                return
             self._exit(name, why, spot_ltp, fut_ltp)
             return
         if p.get("target") is not None and \
@@ -280,14 +295,120 @@ class Trader:
                         f"Stop moved to entry {p['spot_entry']}.")
 
     def square_off(self, reason="15:15 SQUARE-OFF"):
-        """Close every open position (all books)."""
+        """Close every open position (all books) at market; a pending limit exit sends its rest at market."""
         open_ = self.positions()
         if not open_:
             return
         syms = sorted({s for _, p in open_ for s in (p["spot"], p["future"])})
         q = self.client.ltp(syms)
         for name, p in open_:
+            if name in self._busy:
+                continue
+            if p.get("pending"):
+                self._step_exit(name, q.get(p["spot"]), force=reason)
+                continue
             self._exit(name, reason, q.get(p["spot"]), q.get(p["future"]))
+
+    def square_off_limits(self):
+        """15:10 (paper): every open position without a pending exit starts a limit exit (guard = its stop)."""
+        if not self.paper:
+            return
+        open_ = [(n, p) for n, p in self.positions() if not p.get("pending") and n not in self._busy]
+        if not open_:
+            return
+        q = self.client.ltp(sorted({p["spot"] for _, p in open_}))
+        for name, p in open_:
+            if not self._start_limit_exit(name, "15:10 SQUARE-OFF", q.get(p["spot"]), kind="squareoff"):
+                self._exit(name, "15:10 SQUARE-OFF", q.get(p["spot"]), None)
+
+    # ---------- limit exits (paper) ----------
+    def _book(self, fut):
+        d = self.client.depth(fut)
+        return d["bids"], d["asks"]
+
+    def _start_limit_exit(self, name, reason, spot_ltp, kind):
+        """kind "trail": only when a market exit would slip more than EXIT_SLIP_CAP_PCT (returns False otherwise:
+        the caller exits at market). kind "squareoff": always. Returns True when the limit exit took over."""
+        p = self.book(name)["position"]
+        try:
+            book = self._book(p["future"])
+        except Exception as e:  # noqa: BLE001
+            log.warning("limit exit %s: no depth (%s), exiting at market", p["future"], e)
+            return False
+        take = execution.exit_take_side(p["side"])
+        levels = execution.our_side(book, take)
+        if not levels:
+            return False
+        if kind == "trail" and not execution.exit_needs_limit(book, p["side"], p["qty"], config.EXIT_SLIP_CAP_PCT):
+            return False
+        mslip = execution.market_slip_pct(levels, p["qty"], take)
+        sign = 1 if p["side"] == "LONG" else -1
+        if kind == "trail":
+            ref = p["stop"] if p["spot"] == p["future"] else levels[0][0]     # the trail stop (on the future)
+            guard = p["spot_entry"] + sign * config.EXIT_GUARD_R * p["risk"]
+        else:
+            ref, guard = levels[0][0], p["stop"]
+        pend = execution.start_exit(p["side"], p["qty"], p.get("tick") or 0.05, ref, config.EXIT_SLIP_CAP_PCT, guard,
+                                    reason, kind)
+        pend["unit"] = p.get("lot") or p["qty"]
+        p["pending"] = pend
+        self.save()
+        venue = execution.PaperVenue(lambda: self._book(p["future"]))
+        self._busy.add(name)
+        try:
+            execution.exit_steps(pend, venue, pend["unit"], p.get("tick") or 0.05, book, sleep=self.sleep,
+                                 max_children=config.EXIT_MAX_CHILDREN)
+        finally:
+            self._busy.discard(name)
+        why = ("market order would slip " + ("more than the 5 levels hold" if mslip is None else f"{mslip:.3f}%")
+               if kind == "trail" else "15:10 square-off")
+        msg = (f"{reason} {p['future']} [{label(name)}]: {why} -> limit exit. Floor {pend['floor']:g} (ref {ref:g} "
+               f"- {config.EXIT_SLIP_CAP_PCT:.1%}); filled {pend['qty'] - pend['left']:g}/{pend['qty']:g} in "
+               f"{pend['children']} order(s)")
+        if not execution.exit_done(pend):
+            msg += (f"; {pend['left']:g} waiting at {pend['floor']:g}, market if the {config.PRICE_LABEL.lower()} "
+                    f"reaches {guard:g}" + (" (its stop)" if kind == "squareoff" else
+                                             f" (entry {'+' if sign > 0 else '-'} {config.EXIT_GUARD_R:g}R)")
+                    + ", or at 15:15")
+        log.info("LIMIT EXIT [%s] %s", name, msg)
+        self.notify(f"⏳ {msg}")
+        if execution.exit_done(pend):
+            self._finish_limit_exit(name, spot_ltp)
+        else:
+            self.save()
+        return True
+
+    def _step_exit(self, name, spot_ltp, force=None):
+        """A pending limit exit: the rest at market if the guard is crossed (or force: 15:15), else the resting
+        limit at the floor is checked against the current depth."""
+        p = self.book(name)["position"]
+        pend = p["pending"]
+        try:
+            book = self._book(p["future"])
+        except Exception as e:  # noqa: BLE001
+            log.warning("pending exit %s: no depth (%s)", p["future"], e)
+            if not force:
+                return
+            q = self.client.ltp([p["future"]]).get(p["future"]) or p["fut_entry"]
+            book = ([(q, p["qty"])], [(q, p["qty"])])
+        if force:
+            execution.exit_market(pend, book, force)
+        elif execution.guard_crossed(p["side"], spot_ltp, pend["guard"]):
+            execution.exit_market(pend, book, "stop hit" if pend["kind"] == "squareoff" else
+                                  f"price back to entry {'+' if p['side'] == 'LONG' else '-'} {config.EXIT_GUARD_R:g}R")
+        else:
+            execution.exit_rest(pend, book, pend.get("unit") or p["qty"])
+        if execution.exit_done(pend):
+            self._finish_limit_exit(name, spot_ltp)
+        else:
+            self.save()
+
+    def _finish_limit_exit(self, name, spot_ltp):
+        p = self.book(name)["position"]
+        ex = execution.exit_summary(p["pending"])
+        ex["exit_slip_inr"] = round(ex.pop("exit_slip_money") or 0.0, 2)
+        ex["exit_avg"] = round(ex["exit_avg"], 4)
+        self._close(name, p["pending"]["reason"], ex["exit_avg"], spot_ltp if spot_ltp is not None else ex["exit_avg"], ex)
 
     def exit_estimate(self, p):
         """Paper: slippage of the market exit estimated by walking the live depth (P&L still uses the LTP).
@@ -311,7 +432,9 @@ class Trader:
         p = self.book(name)["position"]
         if self.paper:
             fut_px = fut_ltp if fut_ltp else self.client.ltp([p["future"]]).get(p["future"], p["fut_entry"])
-            self._close(name, reason, fut_px, spot_px, self.exit_estimate(p))
+            ex = self.exit_estimate(p)
+            ex["exit_type"] = "market"
+            self._close(name, reason, fut_px, spot_px, ex)
             return
         try:
             if p["backup_id"]:
@@ -331,7 +454,7 @@ class Trader:
         if fut_ltp:   # live: the fill vs the future's LTP when the exit was decided
             pct, money = execution.slippage("SELL" if p["side"] == "LONG" else "BUY", fut_ltp, fut_px, p["qty"])
             ex = {"exit_ref": fut_ltp, "exit_avg": fut_px, "exit_slip_pct": round(pct, 4),
-                  "exit_slip_inr": round(money, 2), "exit_children": 1, "exit_estimated": "no"}
+                  "exit_slip_inr": round(money, 2), "exit_children": 1, "exit_estimated": "no", "exit_type": "market"}
         self._close(name, reason, fut_px, spot_px, ex)
 
     def _close(self, name, reason, fut_exit, spot_exit, ex=None):
@@ -349,7 +472,7 @@ class Trader:
             TRADES_CSV.rename(TRADES_CSV.with_name("trades_futures_only.csv"))   # old column layout: archive it
         if TRADES_CSV.exists():
             lines = TRADES_CSV.read_text().splitlines(keepends=True)
-            if lines and "exit_estimated" not in lines[0]:
+            if lines and "exit_type" not in lines[0]:
                 lines[0] = ",".join(TRADE_COLS) + "\n"     # add the trail / execution columns to the header
                 TRADES_CSV.write_text("".join(lines))
         new = not TRADES_CSV.exists()
@@ -366,12 +489,16 @@ class Trader:
                           ("entry_ref", "entry_avg", "entry_slip_pct", "entry_slip_inr", "entry_children",
                            "qty_intended", "qty_filled", "liq_capped")]
                        + [(ex or {}).get(k, "") for k in
-                          ("exit_ref", "exit_avg", "exit_slip_pct", "exit_slip_inr", "exit_children", "exit_estimated")])
+                          ("exit_ref", "exit_avg", "exit_slip_pct", "exit_slip_inr", "exit_children", "exit_estimated",
+                           "exit_type")])
         emoji = "✅" if pnl > 0 else "❌"
         self.notify(f"{emoji} EXIT {short_name(p['spot'])} [{label(name)}] ({reason})\n"
                     + (f"Future {p['future']} @ {fut_exit}\n" if p["spot"] == p["future"] else
                        f"Spot {spot_exit} | Future {p['future']} @ {fut_exit}\n") +
+                    f"{execution.exit_text(ex)}\n"
                     f"Net P&L ₹{pnl:,.0f} | {label(name)} balance ₹{bk['balance']:,.0f}")
+        log.info("EXIT [%s] %s %s (%s) @ %s | %s | net %.0f", name, p["future"], p["side"], reason, fut_exit,
+                 execution.exit_text(ex), pnl)
         if self.daily_limit_hit(name):
             self.notify(f"🛑 [{label(name)}] daily loss limit ({config.DAILY_LOSS_LIMIT_PCT:.0%}) reached. "
                         f"No new entries for this strategy today.")
