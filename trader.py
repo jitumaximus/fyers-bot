@@ -8,6 +8,7 @@ import csv
 import json
 import logging
 import math
+import os
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -20,6 +21,8 @@ log = logging.getLogger("trader")
 STATE_FILE = config.DATA_DIR / "state.json"
 TRADES_CSV = config.DATA_DIR / "trades.csv"
 SIGNALS_CSV = config.DATA_DIR / "signals.csv"
+LIVE_PRICES = config.DATA_DIR / "live_prices.json"   # read-only feed for the website (mintoro-api): open positions only
+LIVE_PRICES_EVERY_S = 3
 FILLED, CANCELLED, REJECTED = 2, 1, 5
 BOOKS = ("2H RSI SHORT", "2H RSI LONG", "1H BREAKOUT", "1H BREAKDOWN")
 LABELS = {}     # optional display names for books
@@ -186,8 +189,26 @@ class Trader:
             return
         syms = sorted({s for _, p in open_ for s in (p["spot"], p["future"])})
         q = self.client.ltp(syms)
+        self.write_live_prices(q)
         for name, p in open_:
             self.check(name, q.get(p["spot"]), q.get(p["future"]))
+
+    def write_live_prices(self, q):
+        """Latest prices of the open positions' symbols for the website, at most every LIVE_PRICES_EVERY_S seconds.
+        Written atomically; any failure is logged and ignored, so it can never affect trading."""
+        now = time.time()
+        if now - getattr(self, "_live_prices_t", 0) < LIVE_PRICES_EVERY_S:
+            return
+        self._live_prices_t = now
+        try:
+            prices = {s: float(v) for s, v in (q or {}).items() if isinstance(v, (int, float)) and v > 0}
+            if not prices:
+                return
+            tmp = LIVE_PRICES.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"time": datetime.now(IST).isoformat(timespec="seconds"), "prices": prices}))
+            os.replace(tmp, LIVE_PRICES)
+        except Exception as e:  # noqa: BLE001
+            log.warning("live_prices.json not written: %s", e)
 
     def check(self, name, spot_ltp, fut_ltp):
         p = self.book(name)["position"]
