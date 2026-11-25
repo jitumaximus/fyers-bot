@@ -155,6 +155,11 @@ class FakeClient:
     def depth_totals(self, sym):
         return 60, 40
 
+    def depth(self, sym):   # deep book at the LTP: the capped IOC entry fills at the LTP
+        px = float(self.ltps[sym])
+        return {"bids": [(px - k * 0.05, 1e6) for k in range(5)], "asks": [(px + k * 0.05, 1e6) for k in range(5)],
+                "totalbuyqty": 60.0, "totalsellqty": 40.0}
+
     def margin(self, fut, qty, side):
         return 100_000.0 * qty / 100
 
@@ -245,6 +250,19 @@ class OpenCheckInBot(unittest.TestCase):
         self.assertEqual((p["stop"], p["trail_r"]), (1030.1, 3))
         tr.check("1H BREAKOUT", 1060.0, 1060.0)                     # well past 2R: no target exit
         self.assertIsNotNone(tr.book("1H BREAKOUT")["position"])
+
+    def test_trades_csv_execution_columns(self):
+        c = self.client()
+        self.run_at("09:19:30", c)
+        self.b.trader.square_off()
+        import csv
+        rows = list(csv.DictReader(self.trader_mod.TRADES_CSV.open()))
+        self.assertEqual(list(rows[0].keys())[-14:], self.trader_mod.TRADE_COLS[-14:])
+        up = next(r for r in rows if r["spot"] == "NSE:UP")
+        self.assertEqual((up["entry_ref"], up["entry_avg"], up["entry_children"], up["qty_intended"], up["qty_filled"],
+                          up["liq_capped"]), ("1005.0", "1005.0", "1", "200", "200", "no"))
+        self.assertEqual((up["exit_ref"], up["exit_estimated"]), ("1005.0", "yes"))   # sells into the 1005 bid
+        self.assertEqual(float(up["exit_slip_pct"]), 0.0)
 
     def test_skipped_when_first_seen_after_0920(self):
         c = self.client()

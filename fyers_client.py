@@ -192,12 +192,24 @@ class FyersClient:
     def ltp(self, symbols):
         return {s: float(v["lp"]) for s, v in self.quotes(symbols).items()}
 
-    def depth_totals(self, symbol):
-        """(total buy qty, total sell qty) from market depth."""
+    def depth(self, symbol):
+        """5-level market depth: {"bids": [(price, qty)] best first, "asks": [...], "totalbuyqty", "totalsellqty"}."""
         self.limiter.wait()
         resp = self._check(self.fyers.depth(data={"symbol": symbol, "ohlcv_flag": "1"}))
         d = (resp.get("d") or {}).get(symbol) or {}
-        return float(d.get("totalbuyqty") or 0), float(d.get("totalsellqty") or 0)
+
+        def levels(rows):
+            out = [(float(r.get("price") or 0), float(r.get("volume") or 0)) for r in rows or [] if isinstance(r, dict)]
+            return [(p, q) for p, q in out if p > 0 and q > 0]
+        bids = sorted(levels(d.get("bids")), key=lambda x: -x[0])
+        asks = sorted(levels(d.get("ask") or d.get("asks")), key=lambda x: x[0])
+        return {"bids": bids, "asks": asks, "totalbuyqty": float(d.get("totalbuyqty") or 0),
+                "totalsellqty": float(d.get("totalsellqty") or 0)}
+
+    def depth_totals(self, symbol):
+        """(total buy qty, total sell qty) from market depth."""
+        d = self.depth(symbol)
+        return d["totalbuyqty"], d["totalsellqty"]
 
     def margin(self, symbol, qty, side):
         """SPAN + exposure margin for one order (INR)."""
@@ -212,11 +224,11 @@ class FyersClient:
         return float(resp["data"]["total"])
 
     # ---------------- orders (live mode only) ----------------
-    def place_order(self, symbol, qty, side, order_type, limit_price=0.0, stop_price=0.0):
-        """side: 1 buy / -1 sell. order_type: 1 limit, 2 market, 3 SL-M."""
+    def place_order(self, symbol, qty, side, order_type, limit_price=0.0, stop_price=0.0, validity="DAY"):
+        """side: 1 buy / -1 sell. order_type: 1 limit, 2 market, 3 SL-M. validity: DAY or IOC."""
         self.limiter.wait()
         data = {"symbol": symbol, "qty": qty, "type": order_type, "side": side, "productType": "INTRADAY",
-                "limitPrice": limit_price, "stopPrice": stop_price, "validity": "DAY", "disclosedQty": 0,
+                "limitPrice": limit_price, "stopPrice": stop_price, "validity": validity, "disclosedQty": 0,
                 "offlineOrder": False, "orderTag": config.ORDER_TAG, "isSliceOrder": False}
         resp = self._check(self.fyers.place_order(data=data))
         if resp.get("s") != "ok":
@@ -237,9 +249,14 @@ class FyersClient:
 
     def order_status(self, order_id):
         """Returns (status, traded_price). Fyers status 2 = filled, 1 = cancelled, 5 = rejected, 6 = pending."""
+        status, price, _ = self.order_fill(order_id)
+        return status, price
+
+    def order_fill(self, order_id):
+        """(status, average traded price, filled qty) of one order."""
         self.limiter.wait()
         resp = self._check(self.fyers.orderbook())
         for o in resp.get("orderBook", []) or []:
             if str(o.get("id")) == str(order_id):
-                return int(o.get("status", 0)), float(o.get("tradedPrice") or 0)
-        return None, 0.0
+                return int(o.get("status", 0)), float(o.get("tradedPrice") or 0), float(o.get("filledQty") or 0)
+        return None, 0.0, 0.0

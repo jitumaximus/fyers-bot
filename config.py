@@ -77,6 +77,15 @@ OPEN_BO_MIN_STOP_PCT = 0.003
 # Among those that qualify the biggest move is taken first (before 25 Nov: the furthest beyond the range first).
 OPEN_BO_MIN_MOVE_PCT = 0.01
 OPEN_BO_MAX_MOVE_PCT = 0.02
+# Entry execution (25 Nov 2026, all books; execution.py): capped IOC limit orders on the future instead of a market
+# order (paper: simulated on the live 5-level depth instead of filling at the LTP). Reference = best ask (long) /
+# best bid (short) at the signal; cap = reference +/- ENTRY_SLIP_CAP_PCT; children of at most what rests at the best
+# level, 1 tick worse each, ~1 s apart; one retry with a fresh book; keep what filled, nothing = skipped.
+# Size capped at LIQ_CAP_PCT_OF_DEPTH of the top-5 quantity on our side; under 1 lot = "too little liquidity".
+# Exits stay market orders (paper: their slippage is estimated on the live depth and logged, P&L unchanged).
+ENTRY_SLIP_CAP_PCT = 0.001
+LIQ_CAP_PCT_OF_DEPTH = 0.20
+ENTRY_MAX_CHILDREN = 20       # safety limit per attempt (each child = one depth call + ~1 s)
 IMBALANCE_MIN_SHARE = 0.55  # order book: longs need bids >= 55% of total book qty, shorts need asks >= 55%
 # The filter was never backtested (no historical order books) and blocked nearly every signal, so it is OFF:
 # the bid/ask share is still looked up and written into each signal/entry log for later analysis.
