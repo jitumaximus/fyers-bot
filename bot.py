@@ -56,6 +56,7 @@ class Bot:
         self.tg = Telegram()
         self.client = FyersClient()
         self.trader = Trader(self.client, self.tg.send)
+        self.trader.sleep = self.exec_sleep   # exit child orders: keep monitoring between them
         self.universe = {}
         self.universe_day = None
         self.arms = {}                 # symbol -> {"side", "rsi", "candle"}   (2H RSI)
@@ -426,6 +427,7 @@ class Bot:
         if lots < 1:
             return skip("margin", f"skipped: 1 lot needs ₹{per_lot:,.0f} > balance")
         lot = info["lot"]
+        wanted = lots * lot                            # margin size, before the liquidity cap
         levels_ours = fbook["asks"] if side == "LONG" else fbook["bids"]
         capped, max_qty, depth5 = execution.liquidity_cap(lots * lot, lot, levels_ours, config.LIQ_CAP_PCT_OF_DEPTH)
         res.update(size=lots, depth5_qty=depth5, liq_cap_qty=max_qty, liq_capped="yes" if capped < lots * lot else "no")
@@ -490,7 +492,7 @@ class Bot:
                    size=filled // lot)
         fill = {"entry_ref": ex["ref"], "entry_avg": round(avg, 4), "entry_slip_pct": round(pct, 4),
                 "entry_slip_inr": round(money, 2), "entry_children": ex["children"], "qty_intended": qty,
-                "qty_filled": filled, "liq_capped": res["liq_capped"]}
+                "qty_filled": filled, "liq_capped": res["liq_capped"], "qty_wanted": wanted}
         exec_txt = (f"fill {filled}/{qty} @ {avg:.2f} (ref {ex['ref']}, cap {ex['cap']}, {ex['children']} IOC, "
                     f"slippage {pct:+.3f}% = ₹{money:,.0f})")
         setup = f"{setup} | {exec_txt}"
@@ -513,7 +515,8 @@ class Bot:
         log_signal(now, sym, kind, setup, f"ENTER {fut} @ {avg:.2f} | {config.PRICE_LABEL.lower()} {ltp:g} SL {lv['stop']} "
                                           f"TP {lv['target'] if lv['target'] is not None else 'trail'}")
         try:
-            self.trader.open(strat, sym, fut, side, qty, ltp, avg, lv, margin, setup, info["fut_tick"], fill=fill)
+            self.trader.open(strat, sym, fut, side, qty, ltp, avg, lv, margin, setup, info["fut_tick"], fill=fill,
+                             lot=lot)
             res["taken"] = True
         except Exception as e:
             self.tg.send(f"⚠️ Entry failed on {sym}: {e}")
@@ -561,6 +564,12 @@ class Bot:
             log.info("universe loaded: %d symbols (signals on %s)", len(self.universe), config.PRICE_LABEL.lower())
 
         self.tick()
+
+        # paper: limit exits on every open position from 15:10 (what is left goes at market at 15:15)
+        if config.SQUARE_OFF_LIMIT <= t < config.SQUARE_OFF and self.trader.positions() and \
+                time.time() - self.last_square_try >= 5:
+            self.last_square_try = time.time()
+            self.trader.square_off_limits()
 
         # square off at 15:15; keeps retrying every 5s if a live exit order fails
         if t >= config.SQUARE_OFF and self.trader.positions() and time.time() - self.last_square_try >= 5:
