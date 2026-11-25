@@ -110,12 +110,17 @@ def _div_trigger(df_closed, today, side, window_min):
         return None
     p = df.iloc[ref]
     min_diff = config.RSI_DIV_MIN_RSI_DIFF
+    key = "high" if side == "SHORT" else "low"
+    cand = {"ref_time": p["ts"], "ref_price": float(p[key]), "ref_rsi": round(float(r[ref]), 2),   # candidates.csv
+            "div_time": d["ts"], "div_price": float(d[key]), "div_rsi": round(float(r[n]), 2),
+            "div_open": float(d["open"])}
     if side == "SHORT":
         diff = r[ref] - r[n]
         ok = d["close"] < d["open"] and d["high"] > p["high"] and diff >= min_diff
         if not ok:
             return None
         return {"side": "SHORT", "stop_ref": float(d["high"]), "trigger_ts": d["ts"], "entry_below": float(d["open"]),
+                "cand": dict(cand, rsi_gap=round(float(diff), 2)),
                 "detail": f"red peak {p['ts']:%H:%M} high {p['high']} RSI {r[ref]:.1f} (above EMA5, {n - ref - 1} candles between); "
                           f"red {d['ts']:%H:%M} high {d['high']} RSI {r[n]:.1f}; RSI diff {diff:.1f} (>= {min_diff:g}) "
                           f"-> bearish divergence"}
@@ -124,6 +129,7 @@ def _div_trigger(df_closed, today, side, window_min):
     if not ok:
         return None
     return {"side": "LONG", "stop_ref": float(d["low"]), "trigger_ts": d["ts"], "entry_above": float(d["open"]),
+            "cand": dict(cand, rsi_gap=round(float(diff), 2)),
             "detail": f"green dip {p['ts']:%H:%M} low {p['low']} RSI {r[ref]:.1f} (high < EMA5, {n - ref - 1} candles between); "
                       f"green {d['ts']:%H:%M} low {d['low']} RSI {r[n]:.1f}; RSI diff {diff:.1f} (>= {min_diff:g}) "
                       f"-> bullish divergence"}
@@ -272,6 +278,29 @@ def open_breakout_trigger(rng, c5_open, c5_high, c5_low, ltp):
         return {"side": "SHORT", "stop_ref": max(c5_high, ltp), "open_5m": True,
                 "detail": f"OPEN 5m BREAKDOWN {span}; {c5}, LTP {ltp}; stop above the 5m high"}
     return None
+
+
+def open_move(side, day_open, ltp):
+    """First 5m move from the 09:15 open, in the breakout direction (share of the open; negative = against it)."""
+    if not day_open or not ltp:
+        return None
+    return (ltp - day_open) / day_open if side == "LONG" else (day_open - ltp) / day_open
+
+
+def in_move_band(move):
+    return move is not None and config.OPEN_BO_MIN_MOVE_PCT <= move <= config.OPEN_BO_MAX_MOVE_PCT
+
+
+def range_gap(side, rng, day_open):
+    """Range edge -> 09:15 open, in the breakout direction (share of the edge; negative = opened inside the range)."""
+    edge = rng["high"] if side == "LONG" else rng["low"]
+    return (day_open - edge) / edge if side == "LONG" else (edge - day_open) / edge
+
+
+def beyond_range(side, rng, ltp):
+    """How far the LTP is beyond the broken range edge (share of the edge)."""
+    edge = rng["high"] if side == "LONG" else rng["low"]
+    return (ltp - edge) / edge if side == "LONG" else (edge - ltp) / edge
 
 
 # ---------------- order-book imbalance filter (all strategies) ----------------

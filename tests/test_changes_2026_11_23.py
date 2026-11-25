@@ -145,6 +145,9 @@ class FakeClient:
     def ltp(self, syms):
         return {s: self.ltps[s] for s in syms if s in self.ltps}
 
+    def quotes(self, syms):   # no open/high/low in these quotes: the 09:19:30 check reads the 5m candle instead
+        return {s: {"lp": self.ltps[s]} for s in syms if s in self.ltps}
+
     def history(self, sym, tf, days):
         self.history_calls.append((sym, tf))
         return self.bars[sym]
@@ -192,6 +195,7 @@ class OpenCheckInBot(unittest.TestCase):
         self.b.market_live = DAY
         self.b.next_arm_refresh = now + timedelta(hours=1)
         self.b.trader.state["day"] = str(DAY)
+        self.trader_mod.CANDIDATES_CSV = config.DATA_DIR / "candidates.csv"
         rng = {"high": 1000.0, "low": 995.0, "pct": 0.005, "wick_high": 1010.0, "wick_low": 980.0,
                "from": "x", "to": "y"}
         self.b.ranges = {s: dict(rng) for s in self.b.universe}
@@ -200,8 +204,9 @@ class OpenCheckInBot(unittest.TestCase):
         return now
 
     def client(self):
-        bars = {"NSE:UP": bar5(1001.0, 1006.0, 1000.5, 1005.0),       # green, above range: stop 1000.45 (0.45%)
-                "NSE:DOWN": bar5(994.0, 994.5, 990.0, 992.0),          # red, below: stop 994.55 -> 0.26% -> widened
+        # first 5m moves must be 1-2% since 25 Nov (OPEN_BO_MIN/MAX_MOVE_PCT)
+        bars = {"NSE:UP": bar5(993.0, 1006.0, 992.5, 1005.0),         # green +1.21%, above range: stop 992.45 (1.25%)
+                "NSE:DOWN": bar5(1004.0, 1004.5, 990.0, 992.0),        # red -1.20%, below: stop 1004.55 (1.27%)
                 "NSE:FLAT": bar5(997.0, 998.0, 996.0, 997.5),
                 "NSE:REDUP": bar5(1004.0, 1004.5, 1001.0, 1002.0)}     # above the range but red: no entry
         ltps = {"NSE:UP": 1005.0, "NSE:DOWN": 992.0, "NSE:FLAT": 997.5, "NSE:REDUP": 1002.0}
@@ -215,12 +220,12 @@ class OpenCheckInBot(unittest.TestCase):
         pos = dict(self.b.trader.positions())
         bo, bd = pos["1H BREAKOUT"], pos["1H BREAKDOWN"]
         self.assertEqual((bo["spot"], bo["side"], bo["stop"], bo["target"], bo["trail"]),
-                         ("NSE:UP", "LONG", 1000.45, None, True))
+                         ("NSE:UP", "LONG", 992.45, None, True))
         self.assertEqual(bo["stop_basis"], "candle")
         self.assertIn("OPEN 5m BREAKOUT", bo["setup"])
         self.assertEqual((bd["spot"], bd["side"], bd["stop"], bd["stop_basis"], bd["target"]),
-                         ("NSE:DOWN", "SHORT", 994.95, "min 0.3%", None))   # 992 * 1.003 = 994.976 -> 994.95
-        self.assertIn("widened to 0.3%", bd["setup"])
+                         ("NSE:DOWN", "SHORT", 1004.55, "candle", None))
+        self.assertIn("first 5m move 1.20%", bd["setup"])
         sig = self.trader_mod.SIGNALS_CSV.read_text()
         self.assertIn("TRIGGER 1H BREAKOUT OPEN 5m", sig)
         self.assertIn("TRIGGER 1H BREAKDOWN OPEN 5m", sig)
@@ -233,12 +238,12 @@ class OpenCheckInBot(unittest.TestCase):
         c = self.client()
         self.run_at("09:19:30", c)
         tr = self.b.trader
-        tr.check("1H BREAKOUT", 1009.6, 1009.6)                     # 1R = 4.55 -> 1009.55: breakeven
+        tr.check("1H BREAKOUT", 1017.6, 1017.6)                     # 1R = 12.55 -> 1017.55: breakeven
         p = tr.book("1H BREAKOUT")["position"]
         self.assertEqual((p["stop"], p["at_breakeven"]), (1005.0, True))
-        tr.check("1H BREAKOUT", 1018.7, 1018.7)                     # 3R -> stop at 2R = 1014.1
-        self.assertEqual((p["stop"], p["trail_r"]), (1014.1, 3))
-        tr.check("1H BREAKOUT", 1030.0, 1030.0)                     # well past 2R: no target exit
+        tr.check("1H BREAKOUT", 1042.7, 1042.7)                     # 3R -> stop at 2R = 1030.1
+        self.assertEqual((p["stop"], p["trail_r"]), (1030.1, 3))
+        tr.check("1H BREAKOUT", 1060.0, 1060.0)                     # well past 2R: no target exit
         self.assertIsNotNone(tr.book("1H BREAKOUT")["position"])
 
     def test_skipped_when_first_seen_after_0920(self):

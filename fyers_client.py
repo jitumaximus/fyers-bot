@@ -175,17 +175,22 @@ class FyersClient:
         df["ts"] = pd.to_datetime(df["ts"], unit="s", utc=True).dt.tz_convert(IST)
         return df
 
-    def ltp(self, symbols):
+    def quotes(self, symbols):
+        """{symbol: Fyers quote 'v' dict} (lp = last price; open_price / high_price / low_price = today so far),
+        50 symbols per call. Symbols without a last price are left out."""
         symbols = list(dict.fromkeys(symbols))      # in FUTURES mode scan symbol and future are the same
         out = {}
         for i in range(0, len(symbols), 50):
             self.limiter.wait()
             resp = self._check(self.fyers.quotes(data={"symbols": ",".join(symbols[i:i + 50])}))
             for q in resp.get("d", []) or []:
-                lp = (q.get("v") or {}).get("lp")
-                if lp:
-                    out[q["n"]] = float(lp)
+                v = q.get("v") or {}
+                if isinstance(v, dict) and v.get("lp"):
+                    out[q["n"]] = v
         return out
+
+    def ltp(self, symbols):
+        return {s: float(v["lp"]) for s, v in self.quotes(symbols).items()}
 
     def depth_totals(self, symbol):
         """(total buy qty, total sell qty) from market depth."""

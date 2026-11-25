@@ -21,6 +21,12 @@ log = logging.getLogger("trader")
 STATE_FILE = config.DATA_DIR / "state.json"
 TRADES_CSV = config.DATA_DIR / "trades.csv"
 SIGNALS_CSV = config.DATA_DIR / "signals.csv"
+CANDIDATES_CSV = config.DATA_DIR / "candidates.csv"   # every setup that passed at a check, taken or not
+# Same columns in the binance-bot's candidates.csv. *_pct are percentages; blank = not applicable / not known.
+CAND_COLS = ["time", "bot", "book", "symbol", "side", "check", "taken", "reason", "rank",
+             "range_low", "range_high", "candle_open", "ltp", "move_pct", "candle_colour", "gap_pct", "beyond_pct",
+             "arm_rsi", "ref_time", "ref_price", "ref_rsi", "div_time", "div_price", "div_rsi", "rsi_gap",
+             "div_open", "entry_check", "level", "distance_pct", "stop_candle", "stop_used", "stop_pct", "size"]
 LIVE_PRICES = config.DATA_DIR / "live_prices.json"   # read-only feed for the website (mintoro-api): open positions only
 LIVE_PRICES_EVERY_S = 3
 FILLED, CANCELLED, REJECTED = 2, 1, 5
@@ -43,6 +49,19 @@ def log_signal(ts, symbol, kind, detail, action):
         if new:
             w.writerow(["time", "symbol", "type", "detail", "action"])
         w.writerow([ts.strftime("%Y-%m-%d %H:%M:%S"), symbol, kind, detail, action])
+
+
+def log_candidate(row):
+    """One row in candidates.csv. Never raises: a logging problem must not affect trading."""
+    try:
+        new = not CANDIDATES_CSV.exists()
+        with CANDIDATES_CSV.open("a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=CAND_COLS, extrasaction="ignore")
+            if new:
+                w.writeheader()
+            w.writerow({k: ("" if v is None else v) for k, v in row.items()})
+    except Exception as e:
+        log.warning("candidates.csv: %s", e)
 
 
 def _tick_round(price, tick, mode):
