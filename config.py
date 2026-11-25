@@ -72,6 +72,11 @@ BREAKOUT_CHECK_MINUTE = 12  # check the forming 15m candle at its 12th minute
 # from TRAIL_START_R. Same books and limits as the minute-12 check. Logged as "OPEN 5m".
 BREAKOUT_OPEN_CHECK = time(9, 19, 30)
 OPEN_BO_MIN_STOP_PCT = 0.003
+# Move band (25 Nov): at the 09:19:30 check only breaks whose first 5m move (LTP vs the 09:15 open, in the breakout
+# direction) is between these qualify; the rest are skipped and logged in candidates.csv as "outside move band".
+# Among those that qualify the biggest move is taken first (before 25 Nov: the furthest beyond the range first).
+OPEN_BO_MIN_MOVE_PCT = 0.01
+OPEN_BO_MAX_MOVE_PCT = 0.02
 IMBALANCE_MIN_SHARE = 0.55  # order book: longs need bids >= 55% of total book qty, shorts need asks >= 55%
 # The filter was never backtested (no historical order books) and blocked nearly every signal, so it is OFF:
 # the bid/ask share is still looked up and written into each signal/entry log for later analysis.

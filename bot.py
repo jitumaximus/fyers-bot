@@ -10,7 +10,7 @@ import config
 import strategy
 from fyers_client import AuthError, FyersClient, now_ist
 from telegram_bot import Telegram
-from trader import BOOKS, Trader, label, log_signal
+from trader import BOOKS, Trader, label, log_candidate, log_signal
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s",
                     handlers=[logging.FileHandler(config.DATA_DIR / "bot.log"), logging.StreamHandler()])
@@ -177,12 +177,44 @@ class Bot:
         log.info("refreshed: %d short armed, %d long armed, %d 1H ranges; next %s", shorts,
                  len(new_arms) - shorts, len(new_ranges), self.next_arm_refresh)
 
+    # ---------------- candidates.csv ----------------
+    def candidate(self, now, book, sym, side, check, rank, res=None, reason="", **nums):
+        """One row per setup that passed at a check, taken or not (trader.CAND_COLS). res = try_enter's result."""
+        res = res or {}
+        row = {"time": now.strftime("%Y-%m-%d %H:%M:%S"), "bot": "fyers-bot", "book": book, "symbol": sym,
+               "side": side, "check": check, "rank": rank}
+        row.update(nums)
+        row.update({k: v for k, v in res.items() if k not in ("taken", "reason")})
+        row["taken"] = "yes" if res.get("taken") else "no"
+        row["reason"] = "" if res.get("taken") else (res.get("reason") or reason)
+        for k, v in row.items():
+            if isinstance(v, float):
+                row[k] = round(v, 3) if k.endswith("_pct") else round(v, 4)
+            elif hasattr(v, "strftime"):
+                row[k] = v.strftime("%Y-%m-%d %H:%M")
+        log_candidate(row)
+
+    @staticmethod
+    def pct(x):
+        return None if x is None else x * 100
+
+    def bo_nums(self, side, rng, ltp, sig=None, tick=0.0, **more):
+        """Range numbers shared by the opening and minute-12 rows."""
+        out = {"range_low": rng["low"], "range_high": rng["high"], "ltp": ltp,
+               "beyond_pct": self.pct(strategy.beyond_range(side, rng, ltp)) if ltp else None}
+        if sig:
+            out["stop_candle"] = sig["stop_ref"] + (tick if side == "SHORT" else -tick)
+        out.update(more)
+        return out
+
     # ---------------- triggers ----------------
     def check_triggers(self, now, side):
         tf = config.SHORT_TF if side == "SHORT" else config.LONG_TF
         book = f"2H RSI {side}"
+        check = f"{tf}m close"
         armed = [s for s, a in self.arms.items() if a["side"] == side]
         armed.sort(key=lambda s: self.arms[s]["rsi"], reverse=(side == "SHORT"))  # most extreme first
+        rank = 0
         for sym in armed:
             self.tick()
             if not self.trader.can_enter(book):
@@ -195,15 +227,23 @@ class Bot:
             if not sig or self.last_seen.get((sym, side)) == sig["trigger_ts"]:
                 continue
             self.last_seen[(sym, side)] = sig["trigger_ts"]
+            rank += 1
+            tick = self.universe[sym]["tick"]
+            nums = dict(sig.get("cand") or {}, arm_rsi=round(self.arms[sym]["rsi"], 2),
+                        stop_candle=sig["stop_ref"] + (tick if side == "SHORT" else -tick))
             if side == "SHORT" and self.trader.in_cooldown(book, sym, config.SHORT_COOLDOWN_MIN, now):
                 log_signal(now, sym, f"TRIGGER {book}", sig["detail"],
                            f"skipped: cooldown ({config.SHORT_COOLDOWN_MIN} min after the last {sym} short)")
+                self.candidate(now, book, sym, side, check, rank, reason="cooldown", **nums)
                 continue
-            self.try_enter(now, sym, sig, book, f"2H RSI {self.arms[sym]['rsi']:.1f} | {sig['detail']}")
+            res = self.try_enter(now, sym, sig, book, f"2H RSI {self.arms[sym]['rsi']:.1f} | {sig['detail']}")
+            self.candidate(now, book, sym, side, check, rank, res, **nums)
 
     def check_breakouts(self, now, candle_ts):
         """Minute 12 of each 15m candle: consolidating futures trading above (breakout) or below (breakdown) their
-        1H range; the 15m candle must be green (long) / red (short) so far."""
+        1H range; the 15m candle must be green (long) / red (short) so far. Strongest break first. A book that is
+        busy (or filled earlier in this check) still gets a candidates.csv row for each break, from the one price
+        call (15m colour "not checked": that would need a candle call per symbol)."""
         if not self.ranges:
             return
         prices = self.client.ltp(list(self.ranges))
@@ -213,77 +253,127 @@ class Bot:
             return p / r["high"] if p > r["high"] else (r["low"] / p if 0 < p < r["low"] else 0)
         outside = [s for s in self.ranges if strength(s) > 1]
         outside.sort(key=strength, reverse=True)  # strongest break first
+        check, taken, rank = "15m min 12", {}, {"1H BREAKOUT": 0, "1H BREAKDOWN": 0}
         for sym in outside:
             self.tick()
-            if not (self.trader.can_enter("1H BREAKOUT") or self.trader.can_enter("1H BREAKDOWN")):
-                return
-            if not self.trader.can_enter("1H BREAKOUT" if (prices.get(sym) or 0) > self.ranges[sym]["high"] else "1H BREAKDOWN"):
+            rng, p = self.ranges[sym], prices.get(sym) or 0
+            book = "1H BREAKOUT" if p > rng["high"] else "1H BREAKDOWN"
+            side = "LONG" if book == "1H BREAKOUT" else "SHORT"
+            if taken.get(book) or not self.trader.can_enter(book):
+                rank[book] += 1
+                self.candidate(now, book, sym, side, check, rank[book],
+                               reason="ranked lower" if taken.get(book) else "book busy",
+                               **self.bo_nums(side, rng, p, candle_colour="not checked"))
                 continue
             df15 = self.client.history(sym, config.LONG_TF, days=1)
             row = df15[df15["ts"] == candle_ts] if not df15.empty else df15
             if row.empty:
                 continue
             ltp = self.client.ltp([sym]).get(sym)
-            sig = strategy.breakout_trigger(self.ranges[sym], float(row["open"].iloc[0]), ltp)
+            c_open = float(row["open"].iloc[0])
+            sig = strategy.breakout_trigger(rng, c_open, ltp)
             book = "1H BREAKOUT" if sig and sig["side"] == "LONG" else "1H BREAKDOWN"
             if sig and self.trader.can_enter(book):
-                self.try_enter(now, sym, sig, book, sig["detail"])
+                rank[book] += 1
+                res = self.try_enter(now, sym, sig, book, sig["detail"])
+                self.candidate(now, book, sym, sig["side"], check, rank[book], res,
+                               **self.bo_nums(sig["side"], rng, ltp, sig, self.universe[sym]["tick"], candle_open=c_open,
+                                              candle_colour="green" if sig["side"] == "LONG" else "red"))
+                if res.get("taken"):
+                    taken[book] = sym
 
     def check_open_breakouts(self, now):
         """Once a day at 09:19:30 (config.BREAKOUT_OPEN_CHECK): 1H ranges (yesterday's last 3 closed 1H candles) broken
-        at the open, with the first 5m candle green (breakout) / red (breakdown) so far. Ignores ENTRY_START."""
+        at the open, with the first 5m candle green (breakout) / red (breakdown) so far. Ignores ENTRY_START.
+        One quote call gives every symbol's LTP and today's open / high / low, which at 09:19:30 are the first 5m
+        candle's (a symbol whose quote lacks them falls back to its 5m candle). Only breaks whose first 5m move
+        (LTP vs the 09:15 open) is within OPEN_BO_MIN/MAX_MOVE_PCT qualify; biggest move first."""
         if not self.ranges:
             log.info("OPEN 5m check: no 1H ranges")
             return
-        prices = self.client.ltp(list(self.ranges))
-
-        def strength(s):
-            p, r = prices.get(s) or 0, self.ranges[s]
-            return p / r["high"] if p > r["high"] else (r["low"] / p if 0 < p < r["low"] else 0)
-        outside = sorted((s for s in self.ranges if strength(s) > 1), key=strength, reverse=True)
-        log.info("OPEN 5m check: %d of %d 1H ranges broken at the open", len(outside), len(self.ranges))
+        quotes = self.client.quotes(list(self.ranges))
         first = now.replace(hour=config.MARKET_OPEN.hour, minute=config.MARKET_OPEN.minute, second=0, microsecond=0)
-        for sym in outside:
+        check, cands, broken = "OPEN 5m 09:19:30", [], 0
+        for sym, rng in self.ranges.items():
+            v = quotes.get(sym) or {}
+            ltp = float(v.get("lp") or 0)
+            if not ltp or rng["low"] <= ltp <= rng["high"]:
+                continue
+            broken += 1
+            o, h, l = (float(v.get(k) or 0) for k in ("open_price", "high_price", "low_price"))
+            if not (o and h and l and l <= min(o, ltp) and max(o, ltp) <= h):   # missing or inconsistent quote OHLC
+                self.tick()
+                df5 = self.client.history(sym, config.SHORT_TF, days=1)
+                row = df5[df5["ts"] == first] if not df5.empty else df5
+                if row.empty:
+                    continue
+                c = row.iloc[0]
+                o, h, l = float(c["open"]), float(c["high"]), float(c["low"])
+            sig = strategy.open_breakout_trigger(rng, o, h, l, ltp)
+            if not sig:
+                continue                     # 5m candle not green / red in the break direction: no setup
+            side = sig["side"]
+            move = strategy.open_move(side, o, ltp)
+            cands.append({"sym": sym, "sig": sig, "side": side, "move": move,
+                          "book": "1H BREAKOUT" if side == "LONG" else "1H BREAKDOWN",
+                          "nums": self.bo_nums(side, rng, ltp, sig, self.universe[sym]["tick"], candle_open=o,
+                                               candle_colour="green" if side == "LONG" else "red",
+                                               move_pct=self.pct(move), gap_pct=self.pct(strategy.range_gap(side, rng, o)))})
+        band = sorted((c for c in cands if strategy.in_move_band(c["move"])), key=lambda c: c["move"], reverse=True)
+        log.info("OPEN 5m check: %d of %d 1H ranges broken at the open, %d with the 5m candle in the break direction, "
+                 "%d with a first 5m move of %.1f-%.1f%%", broken, len(self.ranges), len(cands), len(band),
+                 config.OPEN_BO_MIN_MOVE_PCT * 100, config.OPEN_BO_MAX_MOVE_PCT * 100)
+        for c in cands:
+            if c not in band:
+                log_signal(now, c["sym"], "OPEN 5m", c["sig"]["detail"],
+                           f"skipped: first 5m move {c['move'] * 100:.2f}% outside "
+                           f"{config.OPEN_BO_MIN_MOVE_PCT * 100:g}-{config.OPEN_BO_MAX_MOVE_PCT * 100:g}%")
+                self.candidate(now, c["book"], c["sym"], c["side"], check, None, reason="outside move band", **c["nums"])
+        taken, rank, late = {}, {"1H BREAKOUT": 0, "1H BREAKDOWN": 0}, False
+        for c in band:
             self.tick()
-            if now_ist().time() >= OPEN_CANDLE_END:
-                log_signal(now_ist(), sym, "OPEN 5m", "check ran past 09:20", "stopped: first 5m candle closed")
-                return
-            if not (self.trader.can_enter("1H BREAKOUT") or self.trader.can_enter("1H BREAKDOWN")):
-                return
-            if not self.trader.can_enter("1H BREAKOUT" if (prices.get(sym) or 0) > self.ranges[sym]["high"] else "1H BREAKDOWN"):
+            book, sym = c["book"], c["sym"]
+            rank[book] += 1
+            if taken.get(book) or not self.trader.can_enter(book):
+                self.candidate(now, book, sym, c["side"], check, rank[book],
+                               reason="ranked lower" if taken.get(book) else "book busy", **c["nums"])
                 continue
-            df5 = self.client.history(sym, config.SHORT_TF, days=1)
-            row = df5[df5["ts"] == first] if not df5.empty else df5
-            if row.empty:
+            if late or now_ist().time() >= OPEN_CANDLE_END:
+                if not late:
+                    log_signal(now_ist(), sym, "OPEN 5m", "check ran past 09:20", "stopped: first 5m candle closed")
+                late = True
+                self.candidate(now, book, sym, c["side"], check, rank[book], reason="check ran past 09:20", **c["nums"])
                 continue
-            ltp = self.client.ltp([sym]).get(sym)
-            c = row.iloc[0]
-            sig = strategy.open_breakout_trigger(self.ranges[sym], float(c["open"]), float(c["high"]), float(c["low"]), ltp)
-            book = "1H BREAKOUT" if sig and sig["side"] == "LONG" else "1H BREAKDOWN"
-            if sig and self.trader.can_enter(book):
-                self.try_enter(now_ist(), sym, sig, book, sig["detail"])
+            res = self.try_enter(now_ist(), sym, c["sig"], book, c["sig"]["detail"] + f"; first 5m move {c['move'] * 100:.2f}%")
+            self.candidate(now, book, sym, c["side"], check, rank[book], res, **c["nums"])
+            if res.get("taken"):
+                taken[book] = sym
 
     def try_enter(self, now, sym, sig, strat, setup):
+        """Returns {"taken", "reason" (short, for candidates.csv), "size", "stop_used", "stop_pct", "entry_check"}."""
         info, side = self.universe[sym], sig["side"]
         opening = sig.get("open_5m", False)          # 09:19:30 OPEN 5m breakout / breakdown
         kind = f"TRIGGER {strat}" + (" OPEN 5m" if opening else "")
+        res = {"taken": False, "reason": ""}
+
+        def skip(reason, action):
+            log_signal(now, sym, kind, setup, action)
+            res["reason"] = reason
+            return res
         try:
             buy, sell = self.client.depth_totals(sym)
             ok, share = strategy.imbalance_ok(side, buy, sell)   # order book of the scanned symbol
             book = f"{'bids' if side == 'LONG' else 'asks'} {share * 100:.0f}% of book"
         except Exception as e:
             if config.IMBALANCE_FILTER:
-                log_signal(now, sym, kind, setup, f"skipped: depth lookup failed ({e})")
-                return
+                return skip("order book (lookup failed)", f"skipped: depth lookup failed ({e})")
             ok, book = True, "book n/a"
         if config.IMBALANCE_FILTER and not ok:
-            log_signal(now, sym, kind, setup, f"skipped: order book against it ({book})")
-            return
+            return skip("order book", f"skipped: order book against it ({book})")
         setup = f"{setup} | {book}"
         fut = info["future"]
         if not self.trader.paper and self.trader.future_held_elsewhere(fut, strat):
-            log_signal(now, sym, kind, setup, f"skipped: {fut} already held by another strategy (live mode)")
-            return
+            return skip("held by another book", f"skipped: {fut} already held by another strategy (live mode)")
         balance = self.trader.balance(strat)   # this strategy's own capital
         try:
             per_lot = self.client.margin(fut, info["lot"], side)
@@ -295,24 +385,26 @@ class Bot:
                     break
                 lots -= 1
         except Exception as e:
-            log_signal(now, sym, kind, setup, f"skipped: margin lookup failed ({e})")
-            return
+            return skip("margin (lookup failed)", f"skipped: margin lookup failed ({e})")
         if lots < 1:
-            log_signal(now, sym, kind, setup, f"skipped: 1 lot needs ₹{per_lot:,.0f} > balance")
-            return
+            return skip("margin", f"skipped: 1 lot needs ₹{per_lot:,.0f} > balance")
+        res["size"] = lots
         qty = info["lot"] * lots
         setup = f"{lots} lot(s) | {setup}"
         q = self.client.ltp([sym, fut])
         ltp, fut_ltp = q.get(sym), q.get(fut)   # spot builds the levels; future is what we buy/sell
         if not fut_ltp:
-            log_signal(now, sym, kind, setup, f"skipped: no price for {fut}")
-            return
-        if sig.get("entry_below") and ltp and ltp >= sig["entry_below"]:
-            log_signal(now, sym, kind, setup, f"skipped: price {ltp} not below the red candle's body high {sig['entry_below']}")
-            return
-        if sig.get("entry_above") and ltp and ltp <= sig["entry_above"]:
-            log_signal(now, sym, kind, setup, f"skipped: price {ltp} not above the green candle's body low {sig['entry_above']}")
-            return
+            return skip("no price", f"skipped: no price for {fut}")
+        if sig.get("entry_below") and ltp:
+            ok = ltp < sig["entry_below"]
+            res["entry_check"] = f"{ltp:g} {'<' if ok else '>='} open {sig['entry_below']:g}"
+            if not ok:
+                return skip("entry check", f"skipped: price {ltp} not below the red candle's body high {sig['entry_below']}")
+        if sig.get("entry_above") and ltp:
+            ok = ltp > sig["entry_above"]
+            res["entry_check"] = f"{ltp:g} {'>' if ok else '<='} open {sig['entry_above']:g}"
+            if not ok:
+                return skip("entry check", f"skipped: price {ltp} not above the green candle's body low {sig['entry_above']}")
         trail, gap = False, None
         try:   # trend-day check: today's open vs the day's high (short) / low (long) so far
             d5 = self.client.history(sym, config.SHORT_TF, days=1)
@@ -333,8 +425,8 @@ class Bot:
             config.LONG_MIN_STOP_PCT if strat == "2H RSI LONG" else 0.0
         lv = strategy.levels(side, ltp, sig["stop_ref"], max_loss, qty, info["tick"], trail, min_stop) if ltp else None
         if not lv:
-            log_signal(now, sym, kind, setup, f"skipped: price {ltp} already past stop level")
-            return
+            return skip("price past stop", f"skipped: price {ltp} already past stop level")
+        res.update(stop_used=lv["stop"], stop_pct=abs(lv["stop"] - ltp) / ltp * 100)
         if opening and lv["stop_basis"] != "candle":
             candle_stop = sig["stop_ref"] + (info["tick"] if side == "SHORT" else -info["tick"])
             setup = (f"{setup} | 5m stop {candle_stop:g} ({abs(candle_stop - ltp) / ltp * 100:.2f}%) "
@@ -345,8 +437,11 @@ class Bot:
                                           f"TP {lv['target'] if lv['target'] is not None else 'trail'}")
         try:
             self.trader.open(strat, sym, fut, side, qty, ltp, fut_ltp, lv, margin, setup, info["fut_tick"])
+            res["taken"] = True
         except Exception as e:
             self.tg.send(f"⚠️ Entry failed on {sym}: {e}")
+            res["reason"] = f"entry failed: {str(e)[:80]}"
+        return res
 
     # ---------------- main loop ----------------
     def run(self):

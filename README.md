@@ -26,6 +26,8 @@ Scans the **spot (cash) price** of every NSE stock that has futures and trades t
 - Contract month: before the 22nd, the current month's future; from the 22nd, next month's
 - Holidays: no list needed. After 9:16 AM the bot checks whether Fyers returns today's candles, and only scans if it does (rechecks every 5 minutes)
 - Every arm, trigger, skip and trade is logged to `data/signals.csv` and `data/trades.csv`
+- `data/candidates.csv` (since 25 Nov 2026): one row per setup that passed at a check, taken or not: book, check (`OPEN 5m 09:19:30`, `15m min 12`, `5m close`, `15m close`), taken, reason (ranked lower, book busy, outside move band, cooldown, entry check, margin, ...), rank, and the setup numbers (range, 09:15 / 15m open, LTP, first 5m move %, candle colour, gap %, distance beyond the range %, RSI reference / divergence candles and gap, candle stop, stop used, stop %, lots). No extra API calls: a busy 1H book still gets a row per break from the one price call (15m colour "not checked"); 2H RSI books are only checked while free
+- 09:19:30 opening check: only breaks whose first 5m move (LTP vs the 09:15 open, in the break direction) is 1-2% (`OPEN_BO_MIN_MOVE_PCT` / `OPEN_BO_MAX_MOVE_PCT`) qualify, biggest move first. The open, high and low come from the same quote call as the LTP (at 09:19:30 they are the first 5m candle's)
 
 ## 1. Fyers app setup (one time)
 
