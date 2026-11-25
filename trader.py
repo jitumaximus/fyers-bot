@@ -14,6 +14,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import config
+import execution
 import strategy
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -26,7 +27,10 @@ CANDIDATES_CSV = config.DATA_DIR / "candidates.csv"   # every setup that passed 
 CAND_COLS = ["time", "bot", "book", "symbol", "side", "check", "taken", "reason", "rank",
              "range_low", "range_high", "candle_open", "ltp", "move_pct", "candle_colour", "gap_pct", "beyond_pct",
              "arm_rsi", "ref_time", "ref_price", "ref_rsi", "div_time", "div_price", "div_rsi", "rsi_gap",
-             "div_open", "entry_check", "level", "distance_pct", "stop_candle", "stop_used", "stop_pct", "size"]
+             "div_open", "entry_check", "level", "distance_pct", "stop_candle", "stop_used", "stop_pct", "size",
+             # execution (25 Nov 2026); qty_* in shares (fyers) / coins (binance), size = lots / coins traded
+             "depth5_qty", "liq_cap_qty", "liq_capped", "entry_ref", "entry_cap", "entry_avg", "entry_slip_pct",
+             "entry_slip_money", "entry_children", "qty_intended", "qty_filled"]
 LIVE_PRICES = config.DATA_DIR / "live_prices.json"   # read-only feed for the website (mintoro-api): open positions only
 LIVE_PRICES_EVERY_S = 3
 FILLED, CANCELLED, REJECTED = 2, 1, 5
@@ -39,7 +43,12 @@ def label(name):
 TRADE_COLS = ["mode", "strategy", "spot", "future", "side", "qty", "entry_time",
               "spot_entry", "spot_stop", "stop_basis", "spot_target", "moved_to_entry",
               "fut_entry", "exit_time", "spot_exit", "fut_exit", "reason",
-              "gross_pnl", "costs", "net_pnl", "balance", "setup", "trail", "trail_stop_r"]
+              "gross_pnl", "costs", "net_pnl", "balance", "setup", "trail", "trail_stop_r"] + [
+              # execution (25 Nov 2026): entry = capped IOC children; exit = market (paper: estimated on the depth).
+              # slip_pct / slip_inr: positive = worse than the reference price; qty in shares
+              "entry_ref", "entry_avg", "entry_slip_pct", "entry_slip_inr", "entry_children", "qty_intended",
+              "qty_filled", "liq_capped", "exit_ref", "exit_avg", "exit_slip_pct", "exit_slip_inr", "exit_children",
+              "exit_estimated"]
 
 
 def log_signal(ts, symbol, kind, detail, action):
@@ -150,13 +159,16 @@ class Trader:
         return any(p["future"] == future for b, p in self.positions() if b != name)
 
     # ---------- entry ----------
-    def open(self, name, spot, future, side, qty, spot_entry, fut_ref, lv, margin, setup, fut_tick):
-        """name: the book (= strategy). spot_entry: price the levels were built from. fut_ref: future LTP."""
+    def open(self, name, spot, future, side, qty, spot_entry, fut_ref, lv, margin, setup, fut_tick, fill=None):
+        """name: the book (= strategy). spot_entry: price the levels were built from. fut_ref: future LTP.
+        fill: the capped IOC entry already done by the bot (execution.run_entry; qty = what filled): no entry order
+        is sent here and fut_ref is its average fill. Without it (old path), a market order in live mode."""
         bk = self.book(name)
         fut_entry, entry_id, backup_id, backup_stop = fut_ref, None, None, None
-        if not self.paper:
+        if not self.paper and fill is None:
             entry_id = self.client.place_order(future, qty, 1 if side == "LONG" else -1, 2)
             fut_entry = self._wait_fill(entry_id) or fut_ref
+        if not self.paper:
             # backup stop on the future, a bit wider than the 10% cap, only for when the bot can't act
             dist = config.BACKUP_LOSS_PCT * bk["balance"] / qty
             backup_stop = (_tick_round(fut_entry - dist, fut_tick, "down") if side == "LONG"
@@ -173,7 +185,7 @@ class Trader:
             "trail": lv.get("trail", False), "risk": lv["risk_per_unit"], "trail_r": None, "tick": fut_tick,
             "fut_entry": fut_entry, "margin": margin, "entry_time": datetime.now(IST).isoformat(timespec="seconds"),
             "setup": setup, "entry_id": entry_id, "backup_id": backup_id, "backup_stop": backup_stop,
-            "exit_error": None}
+            "exit_error": None, "exec": fill or {}}
         bk["day_trades"] += 1
         self.save()
         risk = abs(spot_entry - lv["stop"]) * qty
@@ -277,12 +289,29 @@ class Trader:
         for name, p in open_:
             self._exit(name, reason, q.get(p["spot"]), q.get(p["future"]))
 
+    def exit_estimate(self, p):
+        """Paper: slippage of the market exit estimated by walking the live depth (P&L still uses the LTP).
+        Never raises."""
+        try:
+            d = self.client.depth(p["future"])
+            levels = d["bids"] if p["side"] == "LONG" else d["asks"]      # a long exit sells into the bids
+            if not levels:
+                return {}
+            got, avg = execution.walk_market(levels, p["qty"])
+            pct, money = execution.slippage("SELL" if p["side"] == "LONG" else "BUY", levels[0][0], avg, got)
+            return {"exit_ref": levels[0][0], "exit_avg": round(avg, 4), "exit_slip_pct": round(pct, 4),
+                    "exit_slip_inr": round(money, 2), "exit_children": 1,
+                    "exit_estimated": "yes" if got >= p["qty"] else f"yes (5 levels hold {got:g} of {p['qty']})"}
+        except Exception as e:  # noqa: BLE001
+            log.warning("exit slippage estimate %s: %s", p["future"], e)
+            return {}
+
     def _exit(self, name, reason, spot_px, fut_ltp):
         """Close the future at market."""
         p = self.book(name)["position"]
         if self.paper:
             fut_px = fut_ltp if fut_ltp else self.client.ltp([p["future"]]).get(p["future"], p["fut_entry"])
-            self._close(name, reason, fut_px, spot_px)
+            self._close(name, reason, fut_px, spot_px, self.exit_estimate(p))
             return
         try:
             if p["backup_id"]:
@@ -298,9 +327,14 @@ class Trader:
                 self.save()
                 self.notify(f"🚨 EXIT FAILED on {p['future']} [{label(name)}] ({reason}): {e}. Retrying — check Fyers now.")
             return
-        self._close(name, reason, fut_px, spot_px)
+        ex = {}
+        if fut_ltp:   # live: the fill vs the future's LTP when the exit was decided
+            pct, money = execution.slippage("SELL" if p["side"] == "LONG" else "BUY", fut_ltp, fut_px, p["qty"])
+            ex = {"exit_ref": fut_ltp, "exit_avg": fut_px, "exit_slip_pct": round(pct, 4),
+                  "exit_slip_inr": round(money, 2), "exit_children": 1, "exit_estimated": "no"}
+        self._close(name, reason, fut_px, spot_px, ex)
 
-    def _close(self, name, reason, fut_exit, spot_exit):
+    def _close(self, name, reason, fut_exit, spot_exit, ex=None):
         bk = self.book(name)
         p = bk["position"]
         sign = 1 if p["side"] == "LONG" else -1
@@ -315,8 +349,8 @@ class Trader:
             TRADES_CSV.rename(TRADES_CSV.with_name("trades_futures_only.csv"))   # old column layout: archive it
         if TRADES_CSV.exists():
             lines = TRADES_CSV.read_text().splitlines(keepends=True)
-            if lines and "trail_stop_r" not in lines[0]:
-                lines[0] = ",".join(TRADE_COLS) + "\n"     # add the trail columns to the header
+            if lines and "exit_estimated" not in lines[0]:
+                lines[0] = ",".join(TRADE_COLS) + "\n"     # add the trail / execution columns to the header
                 TRADES_CSV.write_text("".join(lines))
         new = not TRADES_CSV.exists()
         with TRADES_CSV.open("a", newline="") as f:
@@ -327,7 +361,12 @@ class Trader:
                         p["entry_time"], p["spot_entry"], p["initial_stop"], p["stop_basis"], p["target"],
                         p["at_breakeven"], p["fut_entry"], datetime.now(IST).isoformat(timespec="seconds"),
                         spot_exit, fut_exit, reason, round(gross, 2), cost, round(pnl, 2), bk["balance"], p["setup"],
-                        p.get("trail", False), (p["trail_r"] - config.TRAIL_GAP_R) if p.get("trail_r") else ""])
+                        p.get("trail", False), (p["trail_r"] - config.TRAIL_GAP_R) if p.get("trail_r") else ""]
+                       + [(p.get("exec") or {}).get(k, "") for k in
+                          ("entry_ref", "entry_avg", "entry_slip_pct", "entry_slip_inr", "entry_children",
+                           "qty_intended", "qty_filled", "liq_capped")]
+                       + [(ex or {}).get(k, "") for k in
+                          ("exit_ref", "exit_avg", "exit_slip_pct", "exit_slip_inr", "exit_children", "exit_estimated")])
         emoji = "✅" if pnl > 0 else "❌"
         self.notify(f"{emoji} EXIT {short_name(p['spot'])} [{label(name)}] ({reason})\n"
                     + (f"Future {p['future']} @ {fut_exit}\n" if p["spot"] == p["future"] else

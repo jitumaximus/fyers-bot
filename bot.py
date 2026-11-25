@@ -7,6 +7,7 @@ import traceback
 from datetime import datetime, time as dtime, timedelta
 
 import config
+import execution
 import strategy
 from fyers_client import AuthError, FyersClient, now_ist
 from telegram_bot import Telegram
@@ -15,6 +16,32 @@ from trader import BOOKS, Trader, label, log_candidate, log_signal
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s",
                     handlers=[logging.FileHandler(config.DATA_DIR / "bot.log"), logging.StreamHandler()])
 log = logging.getLogger("bot")
+
+
+class FyersLiveVenue:
+    """Live IOC limit children on the future (execution.run_entry). A rejected or failed child counts as unfilled."""
+
+    def __init__(self, client, fut):
+        self.client, self.fut = client, fut
+
+    def book(self):
+        d = self.client.depth(self.fut)
+        return d["bids"], d["asks"]
+
+    def ioc(self, side, price, qty, book=None):
+        try:
+            oid = self.client.place_order(self.fut, int(qty), 1 if side == "LONG" else -1, 1,
+                                          limit_price=round(price, 2), validity="IOC")
+        except Exception as e:
+            log.warning("IOC child %s %s @ %s: %s", self.fut, qty, price, e)
+            return 0, None
+        status, px, filled = None, 0.0, 0.0
+        for _ in range(10):                 # an IOC is final at once; poll briefly for the order book to show it
+            status, px, filled = self.client.order_fill(oid)
+            if status in (2, 1, 5):
+                break
+            time.sleep(0.3)
+        return filled, (px or None)
 
 
 OPEN_CANDLE_END = dtime(9, 20)   # end of the first 5m candle (the OPEN 5m check must run before it)
@@ -349,8 +376,19 @@ class Bot:
             if res.get("taken"):
                 taken[book] = sym
 
+    def exec_sleep(self, seconds):
+        """Between entry child orders: keep handling commands and open positions."""
+        end = time.time() + seconds
+        self.tick()
+        left = end - time.time()
+        if left > 0:
+            time.sleep(left)
+
     def try_enter(self, now, sym, sig, strat, setup):
-        """Returns {"taken", "reason" (short, for candidates.csv), "size", "stop_used", "stop_pct", "entry_check"}."""
+        """Returns {"taken", "reason" (short, for candidates.csv), "size", "stop_used", "stop_pct", "entry_check",
+        + the execution fields}. Size: margin lots, then the liquidity cap (LIQ_CAP_PCT_OF_DEPTH of the top-5
+        depth on our side); entry: capped IOC children on the future (execution.run_entry; paper = simulated on the
+        live depth); the levels are then rebuilt on the actual average fill and filled quantity."""
         info, side = self.universe[sym], sig["side"]
         opening = sig.get("open_5m", False)          # 09:19:30 OPEN 5m breakout / breakdown
         kind = f"TRIGGER {strat}" + (" OPEN 5m" if opening else "")
@@ -360,18 +398,17 @@ class Bot:
             log_signal(now, sym, kind, setup, action)
             res["reason"] = reason
             return res
+        fut = info["future"]
         try:
-            buy, sell = self.client.depth_totals(sym)
-            ok, share = strategy.imbalance_ok(side, buy, sell)   # order book of the scanned symbol
-            book = f"{'bids' if side == 'LONG' else 'asks'} {share * 100:.0f}% of book"
+            fbook = self.client.depth(fut)             # the future's 5-level depth at signal time
+            dbook = fbook if sym == fut else self.client.depth(sym)
         except Exception as e:
-            if config.IMBALANCE_FILTER:
-                return skip("order book (lookup failed)", f"skipped: depth lookup failed ({e})")
-            ok, book = True, "book n/a"
+            return skip("order book (lookup failed)", f"skipped: depth lookup failed ({e})")
+        ok, share = strategy.imbalance_ok(side, dbook["totalbuyqty"], dbook["totalsellqty"])
+        book = f"{'bids' if side == 'LONG' else 'asks'} {share * 100:.0f}% of book"
         if config.IMBALANCE_FILTER and not ok:
             return skip("order book", f"skipped: order book against it ({book})")
         setup = f"{setup} | {book}"
-        fut = info["future"]
         if not self.trader.paper and self.trader.future_held_elsewhere(fut, strat):
             return skip("held by another book", f"skipped: {fut} already held by another strategy (live mode)")
         balance = self.trader.balance(strat)   # this strategy's own capital
@@ -388,8 +425,18 @@ class Bot:
             return skip("margin (lookup failed)", f"skipped: margin lookup failed ({e})")
         if lots < 1:
             return skip("margin", f"skipped: 1 lot needs ₹{per_lot:,.0f} > balance")
+        lot = info["lot"]
+        levels_ours = fbook["asks"] if side == "LONG" else fbook["bids"]
+        capped, max_qty, depth5 = execution.liquidity_cap(lots * lot, lot, levels_ours, config.LIQ_CAP_PCT_OF_DEPTH)
+        res.update(size=lots, depth5_qty=depth5, liq_cap_qty=max_qty, liq_capped="yes" if capped < lots * lot else "no")
+        if capped < lot:
+            return skip("too little liquidity", f"skipped: too little liquidity: {config.LIQ_CAP_PCT_OF_DEPTH:.0%} of the "
+                                                f"top-5 {'asks' if side == 'LONG' else 'bids'} ({depth5:g}) < 1 lot ({lot})")
+        if capped < lots * lot:
+            setup = f"{setup} | liquidity cap {lots} -> {capped // lot} lot(s) (top-5 depth {depth5:g})"
+            lots = int(capped // lot)
         res["size"] = lots
-        qty = info["lot"] * lots
+        qty = lot * lots
         setup = f"{lots} lot(s) | {setup}"
         q = self.client.ltp([sym, fut])
         ltp, fut_ltp = q.get(sym), q.get(fut)   # spot builds the levels; future is what we buy/sell
@@ -426,6 +473,36 @@ class Bot:
         lv = strategy.levels(side, ltp, sig["stop_ref"], max_loss, qty, info["tick"], trail, min_stop) if ltp else None
         if not lv:
             return skip("price past stop", f"skipped: price {ltp} already past stop level")
+        # ---- capped IOC entry on the future ----
+        venue = (execution.PaperVenue(lambda: (lambda d: (d["bids"], d["asks"]))(self.client.depth(fut)))
+                 if self.trader.paper else FyersLiveVenue(self.client, fut))
+        ex = execution.run_entry(venue, side, qty, lot, info["fut_tick"], config.ENTRY_SLIP_CAP_PCT,
+                                 (fbook["bids"], fbook["asks"]), sleep=self.exec_sleep,
+                                 max_children=config.ENTRY_MAX_CHILDREN)
+        filled, avg = int(round(ex["filled"])), ex["avg"]
+        res.update(entry_ref=ex["ref"], entry_cap=ex["cap"], entry_children=ex["children"], qty_intended=qty,
+                   qty_filled=filled)
+        if filled < lot or not avg:
+            return skip("no fill within cap", f"skipped: no fill within cap (ref {ex['ref']}, cap {ex['cap']}, "
+                                              f"{ex['children']} IOC child order(s))")
+        pct, money = execution.slippage("BUY" if side == "LONG" else "SELL", ex["ref"], avg, filled)
+        res.update(entry_avg=round(avg, 4), entry_slip_pct=round(pct, 4), entry_slip_money=round(money, 2),
+                   size=filled // lot)
+        fill = {"entry_ref": ex["ref"], "entry_avg": round(avg, 4), "entry_slip_pct": round(pct, 4),
+                "entry_slip_inr": round(money, 2), "entry_children": ex["children"], "qty_intended": qty,
+                "qty_filled": filled, "liq_capped": res["liq_capped"]}
+        exec_txt = (f"fill {filled}/{qty} @ {avg:.2f} (ref {ex['ref']}, cap {ex['cap']}, {ex['children']} IOC, "
+                    f"slippage {pct:+.3f}% = ₹{money:,.0f})")
+        setup = f"{setup} | {exec_txt}"
+        qty = filled
+        if sym == fut:   # FUTURES mode: the levels are rebuilt on the actual average fill and filled quantity
+            ltp = avg
+            lv = strategy.levels(side, avg, sig["stop_ref"], max_loss, qty, info["tick"], trail, min_stop)
+            if not lv:
+                if not self.trader.paper:
+                    self.trader.client.place_order(fut, qty, -1 if side == "LONG" else 1, 2)
+                    self.tg.send(f"⚠️ {fut}: filled {qty} @ {avg:.2f}, already past the stop: closed at market.")
+                return skip("fill past stop", f"skipped: average fill {avg:.2f} already past the stop level")
         res.update(stop_used=lv["stop"], stop_pct=abs(lv["stop"] - ltp) / ltp * 100)
         if opening and lv["stop_basis"] != "candle":
             candle_stop = sig["stop_ref"] + (info["tick"] if side == "SHORT" else -info["tick"])
@@ -433,10 +510,10 @@ class Bot:
                      + (f"widened to {config.OPEN_BO_MIN_STOP_PCT:.1%}" if lv["stop_basis"].startswith("min")
                         else "capped at 10% capital") + f" -> SL {lv['stop']}")
             log.info("OPEN 5m %s: %s", sym, setup.rsplit(" | ", 1)[-1])
-        log_signal(now, sym, kind, setup, f"ENTER {fut} @ {fut_ltp} | {config.PRICE_LABEL.lower()} {ltp} SL {lv['stop']} "
+        log_signal(now, sym, kind, setup, f"ENTER {fut} @ {avg:.2f} | {config.PRICE_LABEL.lower()} {ltp:g} SL {lv['stop']} "
                                           f"TP {lv['target'] if lv['target'] is not None else 'trail'}")
         try:
-            self.trader.open(strat, sym, fut, side, qty, ltp, fut_ltp, lv, margin, setup, info["fut_tick"])
+            self.trader.open(strat, sym, fut, side, qty, ltp, avg, lv, margin, setup, info["fut_tick"], fill=fill)
             res["taken"] = True
         except Exception as e:
             self.tg.send(f"⚠️ Entry failed on {sym}: {e}")

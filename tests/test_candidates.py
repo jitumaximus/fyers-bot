@@ -33,6 +33,12 @@ class FakeClient:
     def depth_totals(self, sym):
         return 100.0, 100.0
 
+    def depth(self, sym):   # deep book at the LTP: fills at the LTP, no slippage, no liquidity cap
+        px = float(self.q[sym]["lp"])
+        lv = [(px, 1e6)] + [(round(px + k * 0.05, 2), 1e6) for k in range(1, 5)]
+        return {"bids": [(px, 1e6)] + [(round(px - k * 0.05, 2), 1e6) for k in range(1, 5)], "asks": lv,
+                "totalbuyqty": 100.0, "totalsellqty": 100.0}
+
     def margin(self, fut, qty, side):
         return 50_000.0 * qty / 100
 
@@ -53,7 +59,7 @@ class FakeTrader:
     def balance(self, b):
         return 250_000.0
 
-    def open(self, name, sym, *a):
+    def open(self, name, sym, *a, **k):
         self.opened.append((name, sym))
         self.busy.add(name)
 
@@ -198,3 +204,56 @@ class Rsi(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Execution(Base):
+    """Liquidity cap and the capped IOC entry, through try_enter (paper: simulated on the depth)."""
+    def run_one(self, asks):
+        ranges = {"C": rng(98, 100)}
+        b = make({"C": q(100, 101.9, 99.8, 101.8)}, ranges)
+        b.client.depth = lambda sym: {"bids": [(101.75, 1e6)], "asks": list(asks), "totalbuyqty": 1.0,
+                                      "totalsellqty": 1.0}
+        b.exec_sleep = lambda s: None
+        b.check_open_breakouts(NOW)
+        return b, self.rows()["C"]
+
+    def test_too_little_liquidity(self):
+        b, r = self.run_one([(101.8, 80)] * 1 + [(101.85 + k * 0.05, 80) for k in range(4)])   # 20% of 400 < 1 lot
+        self.assertEqual((r["taken"], r["reason"], r["depth5_qty"], r["liq_cap_qty"]),
+                         ("no", "too little liquidity", "400", "0"))
+        self.assertEqual(b.trader.opened, [])
+
+    def test_liquidity_cap_cuts_the_size(self):
+        b, r = self.run_one([(101.8, 1000)] + [(101.85 + k * 0.05, 1000) for k in range(4)])   # 20% of 5000 = 1000
+        self.assertEqual((r["taken"], r["liq_capped"], r["size"], r["qty_intended"], r["qty_filled"]),
+                         ("yes", "no", "5", "500", "500"))
+        b, r = self.run_one([(101.8, 300)] + [(101.85 + k * 0.05, 300) for k in range(4)])     # 20% of 1500 = 300
+        self.assertEqual((r["liq_capped"], r["liq_cap_qty"], r["size"], r["qty_intended"]), ("yes", "300", "3", "300"))
+
+    def test_partial_fill_keeps_what_filled(self):
+        # 200 at the best ask, the rest beyond the 0.1% cap (101.8 -> 101.90): 2 of 3 lots fill
+        asks = [(101.8, 200), (102.0, 5000), (102.05, 5000), (102.1, 5000), (102.15, 5000)]
+        b, r = self.run_one(asks)
+        self.assertEqual((r["taken"], r["qty_intended"], r["qty_filled"], r["size"], r["entry_ref"], r["entry_cap"]),
+                         ("yes", "500", "200", "2", "101.8", "101.9"))
+        self.assertEqual(float(r["entry_slip_pct"]), 0.0)
+
+    def test_no_fill_within_cap(self):
+        ranges = {"C": rng(98, 100)}
+        b = make({"C": q(100, 101.9, 99.8, 101.8)}, ranges)
+        snaps = iter([{"bids": [], "asks": [(101.8, 5000)] * 5, "totalbuyqty": 1, "totalsellqty": 1}])
+        moved = {"bids": [], "asks": [(102.5, 5000)], "totalbuyqty": 1, "totalsellqty": 1}
+        b.client.depth = lambda sym: next(snaps, moved)
+        b.exec_sleep = lambda s: None
+
+        class Never(bot.execution.PaperVenue):
+            def ioc(self, *a, **k):
+                return 0, None
+        saved = bot.execution.PaperVenue
+        bot.execution.PaperVenue = Never
+        try:
+            b.check_open_breakouts(NOW)
+        finally:
+            bot.execution.PaperVenue = saved
+        r = self.rows()["C"]
+        self.assertEqual((r["taken"], r["reason"], r["qty_filled"]), ("no", "no fill within cap", "0"))
