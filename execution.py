@@ -300,8 +300,11 @@ def entry_text(ex, fmt=lambda x: f"{x:g}"):
     """One line for the log / Telegram: how the entry was done (capped limit children) and its slippage."""
     if not ex or not ex.get("entry_avg"):
         return ""
-    cap = (f", size cut by liquidity to {ex['qty_intended']:g} of {ex.get('qty_risk') or ex.get('qty_wanted') or '?'}"
-           if ex.get("liq_capped") == "yes" else "")
+    want = ex.get("qty_risk") or ex.get("qty_wanted")
+    cap = ""
+    if ex.get("liq_capped") == "yes":
+        cap = f", size cut by liquidity to {ex['qty_intended']:g}" + (
+            f" of {want:g}" if isinstance(want, (int, float)) else "")
     return (f"Entry: limit, {ex.get('entry_children', 1)} order(s), filled {ex.get('qty_filled', 0):g}/"
             f"{ex.get('qty_intended', 0):g} @ avg {fmt(ex['entry_avg'])} vs best {fmt(ex['entry_ref'])}, "
             f"slippage {ex.get('entry_slip_pct', 0):+.3f}%{cap}")
