@@ -57,11 +57,28 @@ class Exits(unittest.TestCase):
     def test_trail_stop_deep_book_exits_at_market(self):
         self.open_long()
         self.to_trail()
+        self.c.books["NSE:UP"] = ([(1030.0, 9999)], [(1030.05, 9999)])         # deep book at the price
         self.tr.check("1H BREAKOUT", 1030.0, 1030.0)
         self.assertIsNone(self.tr.book("1H BREAKOUT")["position"])
         r = self.rows()[-1]
         self.assertEqual((r["reason"], r["exit_type"]), ("TRAIL STOP (2R)", "market"))
-        self.assertTrue(any("Exit: market, slippage +0.000%" in m for m in self.sent))
+        # sold at 1030.0 under the 1030.1 trail stop: +0.010% vs the stop (was always +0.000% vs the best bid)
+        self.assertTrue(any("Exit: market, slippage +0.010% vs stop 1030.1" in m for m in self.sent))
+        self.assertEqual((r["exit_trigger"], r["exit_trigger_slip_pct"], r["exit_slip_pct"]), ("1030.1", "0.0097", "0.0"))
+        self.assertAlmostEqual(float(r["exit_trigger_slip_inr"]), 0.1 * 200)
+
+    def test_stop_gap_fill_worse_than_stop_and_spread(self):
+        self.open_long()
+        self.c.books["NSE:UP"] = ([(990.0, 100), (989.5, 500)], [(990.05, 999)])   # gapped through the 992.45 stop
+        self.tr.check("1H BREAKOUT", 990.0, 990.0)
+        r = self.rows()[-1]
+        avg = (100 * 990.0 + 100 * 989.5) / 200
+        self.assertAlmostEqual(float(r["fut_exit"]), avg)                      # paper fill = the book walk, not the LTP
+        self.assertAlmostEqual(float(r["exit_trigger_slip_pct"]), (992.45 - avg) / 992.45 * 100, places=3)
+        self.assertAlmostEqual(float(r["exit_slip_pct"]), (990.0 - avg) / 990.0 * 100, places=3)
+        self.assertNotEqual(r["entry_spread"], "")
+        msg = next(m for m in self.sent if "Net P&L" in m)
+        self.assertIn("vs stop 992.45", msg)
 
     def test_trail_stop_thin_book_limit_then_fills_at_floor(self):
         self.open_long()

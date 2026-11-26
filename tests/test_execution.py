@@ -35,6 +35,18 @@ class Entry(unittest.TestCase):
         self.assertEqual((r["filled"], r["children"]), (250, 3))
         self.assertAlmostEqual(r["avg"], (100 * 100 + 100.05 * 100 + 100.1 * 50) / 250)
 
+    def test_sweep_takes_the_whole_size_in_one_child(self):
+        # levels 100 ticks apart: stepping a tick per child would never reach them; one sweep IOC at 100.02 does
+        b = book(asks=[(100.0, 2), (100.01, 2), (100.02, 2), (100.5, 99)])
+        r = X.run_entry(Fixed(b), "LONG", 6, 1, 0.0001, 0.001, b, sweep=100.02)
+        self.assertEqual((r["filled"], r["children"]), (6, 1))
+        self.assertAlmostEqual(r["avg"], 100.01)
+        r = X.run_entry(Fixed(b), "LONG", 6, 1, 0.0001, 0.001, b, sweep=100.5)   # never beyond the 100.10 cap
+        self.assertEqual((r["filled"], r["cap"]), (6, 100.1))
+        b = book(bids=[(100.0, 2), (99.99, 2)])
+        r = X.run_entry(Fixed(b), "SHORT", 4, 1, 0.0001, 0.001, b, sweep=99.99)
+        self.assertEqual((r["filled"], r["children"]), (4, 1))
+
     def test_partial_then_retry_then_keep_what_filled(self):
         b = book(asks=[(100.0, 100), (100.2, 1000)])           # the next level is beyond the 100.10 cap
         v = Fixed(b)
@@ -154,10 +166,40 @@ class Exits(unittest.TestCase):
         self.assertEqual((ex["exit_type"], ex["exit_avg"]), ("market", 10.5))
         self.assertIn("book too thin", ex["exit_estimated"])
 
+    def test_exit_slips_signed_never_clamped(self):
+        ex = X.exit_slips("SHORT", 5140.0, 100, touch=5141.9, trigger=5138.7)     # bought below the best ask
+        self.assertAlmostEqual(ex["exit_trigger_slip_pct"], (5140.0 - 5138.7) / 5138.7 * 100, places=4)
+        self.assertAlmostEqual(ex["exit_trigger_slip_money"], 130.0)
+        self.assertLess(ex["exit_slip_pct"], 0)                                     # better than the touch: negative
+        self.assertEqual(ex["exit_ref_name"], "best ask")
+        ex = X.exit_slips("LONG", 99.0, 10, touch=99.5, trigger=100.0, trigger_kind="stop")
+        self.assertAlmostEqual(ex["exit_trigger_slip_pct"], 1.0)                    # sold 1% under the stop
+        self.assertEqual((ex["exit_ref_name"], ex["exit_trigger_kind"]), ("best bid", "stop"))
+        self.assertEqual(X.exit_slips("LONG", 99.0, 10), {"exit_ref_name": "best bid"})
+
+    def test_limit_exit_summary_vs_stop_and_touch(self):
+        p = X.start_exit("LONG", 100, 0.01, 10.0, 0.001, 9.0, "TRAIL STOP", "trail", touch=9.98, trigger=10.0)
+        X.exit_market(p, book(bids=[(9.97, 100)]), "x")
+        ex = X.exit_summary(p)
+        self.assertAlmostEqual(ex["exit_trigger_slip_pct"], 0.3)
+        self.assertAlmostEqual(ex["exit_slip_pct"], (9.98 - 9.97) / 9.98 * 100, places=6)
+
+    def test_spread(self):
+        sp, pct = X.spread(book(bids=[(99.9, 1)], asks=[(100.1, 1)]))
+        self.assertAlmostEqual(sp, 0.2)
+        self.assertAlmostEqual(pct, 0.2)
+        self.assertEqual(X.spread(book(asks=[(1, 1)])), (None, None))
+
     def test_texts(self):
-        self.assertEqual(X.exit_text({"exit_type": "market", "exit_ref": 100, "exit_slip_pct": 0.05,
-                                      "exit_estimated": "yes"}),
-                         "Exit: market, slippage +0.050% vs 100 (estimated on the live book)")
+        self.assertEqual(X.exit_text({"exit_type": "market", "exit_ref": 100, "exit_ref_name": "best bid",
+                                      "exit_slip_pct": 0.05, "exit_estimated": "yes"}),
+                         "Exit: market, slippage +0.050% vs best bid 100 (estimated on the live book)")
+        # short stopped at 5138.7, best ask 5139.5, filled 5140.0: Telegram shows vs the stop, the log both
+        ex = X.exit_slips("SHORT", 5140.0, 250, touch=5139.5, trigger=5138.7)
+        ex.update(exit_type="market", exit_avg=5140.0, exit_estimated="yes")
+        self.assertEqual(X.exit_text(ex), "Exit: market, slippage +0.025% vs stop 5138.7 (estimated on the live book)")
+        self.assertEqual(X.exit_text(ex, full=True), "Exit: market @ avg 5140, slippage +0.025% vs stop 5138.7 "
+                                                    "(+0.010% vs best ask 5139.5) (estimated on the live book)")
         t = X.entry_text({"entry_avg": 1.0002, "entry_ref": 1.0, "entry_children": 2, "qty_filled": 7853,
                           "qty_intended": 7853, "entry_slip_pct": 0.02, "liq_capped": "yes", "qty_risk": 40637})
         self.assertEqual(t, "Entry: limit, 2 order(s), filled 7853/7853 @ avg 1.0002 vs best 1, slippage +0.020%, "
