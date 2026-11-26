@@ -493,6 +493,9 @@ class Bot:
         fill = {"entry_ref": ex["ref"], "entry_avg": round(avg, 4), "entry_slip_pct": round(pct, 4),
                 "entry_slip_inr": round(money, 2), "entry_children": ex["children"], "qty_intended": qty,
                 "qty_filled": filled, "liq_capped": res["liq_capped"], "qty_wanted": wanted}
+        spr, spr_pct = execution.spread((fbook["bids"], fbook["asks"]))   # the cost of crossing it (26 Nov 2026)
+        if spr is not None:
+            fill.update(entry_spread=round(spr, 4), entry_spread_pct=round(spr_pct, 4))
         exec_txt = (f"fill {filled}/{qty} @ {avg:.2f} (ref {ex['ref']}, cap {ex['cap']}, {ex['children']} IOC, "
                     f"slippage {pct:+.3f}% = ₹{money:,.0f})")
         setup = f"{setup} | {exec_txt}"

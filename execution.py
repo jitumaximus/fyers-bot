@@ -72,6 +72,32 @@ def slippage(side, ref, avg, qty):
     return per / ref * 100, per * qty
 
 
+def spread(book):
+    """(best ask - best bid, the same as % of the mid) for a (bids, asks) book; (None, None) if a side is empty."""
+    bids, asks = book
+    if not bids or not asks:
+        return None, None
+    b, a = bids[0][0], asks[0][0]
+    return a - b, (a - b) / ((a + b) / 2) * 100 if a + b else None
+
+
+def exit_slips(pos_side, avg, qty, touch=None, trigger=None, trigger_kind="stop"):
+    """Both exit slippages (26 Nov 2026), signed, never clamped (positive = worse for us):
+      exit_trigger_slip_*: the fill vs the stop / target that triggered the exit (the cost that matters);
+      exit_slip_*:         the fill vs the best bid (long exit) / best ask (short exit) at the moment of exit.
+    Money is in the instrument's currency (per qty)."""
+    side = "SELL" if pos_side == "LONG" else "BUY"
+    out = {"exit_ref_name": "best bid" if side == "SELL" else "best ask"}
+    if touch and avg:
+        p, m = slippage(side, touch, avg, qty)
+        out.update(exit_ref=touch, exit_slip_pct=round(p, 4), exit_slip_money=m)
+    if trigger and avg:
+        p, m = slippage(side, trigger, avg, qty)
+        out.update(exit_trigger=trigger, exit_trigger_kind=trigger_kind, exit_trigger_slip_pct=round(p, 4),
+                   exit_trigger_slip_money=m)
+    return out
+
+
 def walk_market(levels, qty):
     """A market order for qty walked through the levels: (filled qty, average price or None)."""
     left, cost = qty, 0.0
@@ -119,10 +145,12 @@ class PaperVenue:
 
 
 def run_entry(venue, side, qty, unit, tick, cap_pct, first_book, min_units=None, sleep=None, max_children=20,
-              retries=1, cap=None):
+              retries=1, cap=None, sweep=None):
     """Capped IOC entry for qty (a multiple of unit). venue: book() -> (bids, asks); ioc(side, price, qty, book) ->
     (filled, avg). first_book = the book at signal time (gives the reference). sleep(seconds) between children
     (the bot keeps monitoring in it). cap: a fixed limit price instead of reference +/- cap_pct (exits).
+    sweep: the first child is ONE IOC for the whole qty at this limit price (never beyond the cap), e.g. the last
+    level inside a price-impact limit; later children step on from there as usual. None = start at the best price.
     Returns a dict with ref, cap, intended, filled, avg, children, attempts."""
     min_units = round(max(unit, min_units or unit), 10)
     lv0 = our_side(first_book, side)
@@ -145,6 +173,9 @@ def run_entry(venue, side, qty, unit, tick, cap_pct, first_book, min_units=None,
             continue
         out["attempts"] += 1
         price, n = levels[0][0], 0
+        first = sweep is not None and not attempt
+        if first:
+            price = cap if beyond(side, sweep, cap) else sweep
         while filled < qty - 1e-9 and n < max_children and not beyond(side, price, cap):
             if n:
                 if sleep:
@@ -155,6 +186,8 @@ def run_entry(venue, side, qty, unit, tick, cap_pct, first_book, min_units=None,
             best = levels[0][1] if levels else 0.0
             child = round(math.floor(min(rest, best) / unit + 1e-9) * unit, 10)
             child = max(child, min_units)
+            if first and not n:
+                child = round(math.floor(rest / unit + 1e-9) * unit, 10)
             if rest - child < min_units - 1e-9:      # a too-small last child merges into this one
                 child = round(rest, 10)
             if child > rest + 1e-9 or child < min_units - 1e-9:
@@ -201,9 +234,10 @@ def guard_crossed(pos_side, price, guard):
     return price <= guard + 1e-12 if pos_side == "LONG" else price >= guard - 1e-12
 
 
-def start_exit(pos_side, qty, tick, ref, cap_pct, guard, reason, kind, deadline=None):
-    """A pending limit exit (kept in the trade's state, so it survives a restart)."""
-    return {"reason": reason, "kind": kind, "side": pos_side, "ref": ref,
+def start_exit(pos_side, qty, tick, ref, cap_pct, guard, reason, kind, deadline=None, touch=None, trigger=None):
+    """A pending limit exit (kept in the trade's state, so it survives a restart). touch: the best bid / ask when it
+    started; trigger: the stop that triggered it (None for a square-off)."""
+    return {"reason": reason, "kind": kind, "side": pos_side, "ref": ref, "touch": touch, "trigger": trigger,
             "floor": cap_price(exit_take_side(pos_side), ref, cap_pct, tick), "guard": guard, "deadline": deadline,
             "qty": qty, "left": qty, "lim_qty": 0.0, "lim_cost": 0.0, "mkt_qty": 0.0, "mkt_cost": 0.0,
             "children": 0, "rest_fills": 0, "book_short": False, "why_market": ""}
@@ -266,34 +300,51 @@ def exit_summary(pend):
     """Execution fields of a finished pending exit: type, reference, average, slippage (% and money), children."""
     q = pend["lim_qty"] + pend["mkt_qty"]
     avg = (pend["lim_cost"] + pend["mkt_cost"]) / q if q > 0 else None
-    pct, money = slippage("SELL" if pend["side"] == "LONG" else "BUY", pend["ref"], avg, q)
     typ = ("limit" if pend["mkt_qty"] <= 0 else "market" if pend["lim_qty"] <= 0 else "limit+market")
-    out = {"exit_type": typ, "exit_ref": pend["ref"], "exit_floor": pend["floor"], "exit_avg": avg,
-           "exit_slip_pct": None if pct is None else round(pct, 4), "exit_slip_money": money,
-           "exit_children": pend["children"] + pend["rest_fills"] + (1 if pend["mkt_qty"] > 0 else 0),
+    out = {"exit_type": typ, "exit_floor": pend["floor"], "exit_avg": avg}
+    # vs the best bid / ask when the exit started (older pending exits: their reference) and vs the stop
+    out.update(exit_slips(pend["side"], avg, q, pend.get("touch") or pend["ref"], pend.get("trigger")))
+    out.update({"exit_children": pend["children"] + pend["rest_fills"] + (1 if pend["mkt_qty"] > 0 else 0),
            "exit_limit_qty": pend["lim_qty"], "exit_market_qty": pend["mkt_qty"], "why_market": pend["why_market"],
-           "exit_estimated": "sim" + (" (book too thin, rest at last level)" if pend["book_short"] else "")}
+           "exit_estimated": "sim" + (" (book too thin, rest at last level)" if pend["book_short"] else "")})
     if pend["mkt_qty"] > 0:
-        mp, _ = slippage("SELL" if pend["side"] == "LONG" else "BUY", pend["ref"], pend["mkt_cost"] / pend["mkt_qty"],
-                         pend["mkt_qty"])
+        mp, _ = slippage("SELL" if pend["side"] == "LONG" else "BUY", pend.get("touch") or pend["ref"],
+                         pend["mkt_cost"] / pend["mkt_qty"], pend["mkt_qty"])
         out["exit_market_slip_pct"] = round(mp, 4)
     return out
 
 
-def exit_text(ex, fmt=lambda x: f"{x:g}"):
-    """One line for the log / Telegram: how the exit was done and its slippage."""
+def exit_slip_text(ex, fmt=lambda x: f"{x:g}", full=False):
+    """", slippage +0.025% vs stop 5138.7": vs the stop / target when known, else vs the best bid / ask.
+    full (log lines): also the slippage vs the best bid / ask."""
+    trig, book = ex.get("exit_trigger_slip_pct"), ex.get("exit_slip_pct")
+    name = ex.get("exit_ref_name") or "reference"
+    s = ""
+    if trig is not None:
+        s = f", slippage {trig:+.3f}% vs {ex.get('exit_trigger_kind') or 'stop'} {fmt(ex['exit_trigger'])}"
+        if full and book is not None:
+            s += f" ({book:+.3f}% vs {name} {fmt(ex['exit_ref'])})"
+    elif book is not None:
+        s = f", slippage {book:+.3f}% vs {name} {fmt(ex['exit_ref'])}"
+    return s
+
+
+def exit_text(ex, fmt=lambda x: f"{x:g}", full=False):
+    """One line for the log / Telegram: how the exit was done and its slippage (Telegram: vs the stop; full=True for
+    the log adds the slippage vs the best bid / ask)."""
     if not ex:
         return "Exit: market"
     typ = ex.get("exit_type", "market")
-    slip = ex.get("exit_slip_pct")
-    s = "" if slip is None else f", slippage {slip:+.3f}% vs {fmt(ex['exit_ref'])}"
+    s = exit_slip_text(ex, fmt, full)
     if typ == "market":
         est = " (estimated on the live book)" if str(ex.get("exit_estimated", "")).startswith("yes") else ""
-        return f"Exit: market{s}{est}"
+        avg = f" @ avg {fmt(ex['exit_avg'])}" if ex.get("exit_avg") and full else ""
+        return f"Exit: market{avg}{s}{est}"
     if typ == "limit":
         return f"Exit: limit, {ex['exit_children']} order(s), avg {fmt(ex['exit_avg'])}{s}"
     return (f"Exit: limit {ex['exit_limit_qty']:g} + market {ex['exit_market_qty']:g} ({ex.get('why_market', '')}; "
-            f"market part {ex.get('exit_market_slip_pct', 0):+.3f}%), avg {fmt(ex['exit_avg'])}{s}")
+            f"market part {ex.get('exit_market_slip_pct', 0):+.3f}% vs {ex.get('exit_ref_name') or 'best'}), "
+            f"avg {fmt(ex['exit_avg'])}{s}")
 
 
 def entry_text(ex, fmt=lambda x: f"{x:g}"):
@@ -307,4 +358,6 @@ def entry_text(ex, fmt=lambda x: f"{x:g}"):
             f" of {want:g}" if isinstance(want, (int, float)) else "")
     return (f"Entry: limit, {ex.get('entry_children', 1)} order(s), filled {ex.get('qty_filled', 0):g}/"
             f"{ex.get('qty_intended', 0):g} @ avg {fmt(ex['entry_avg'])} vs best {fmt(ex['entry_ref'])}, "
-            f"slippage {ex.get('entry_slip_pct', 0):+.3f}%{cap}")
+            f"slippage {ex.get('entry_slip_pct', 0):+.3f}%{cap}"
+            + (f", spread {fmt(ex['entry_spread'])} ({ex['entry_spread_pct']:.3f}%)"
+               if ex.get("entry_spread") is not None and ex.get("entry_spread_pct") is not None else ""))
