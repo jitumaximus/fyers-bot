@@ -21,6 +21,16 @@ import strategy
 IST = ZoneInfo("Asia/Kolkata")
 log = logging.getLogger("trader")
 STATE_FILE = config.DATA_DIR / "state.json"
+
+
+def atomic_write(path, text):
+    """Write text to a temp file next to path, fsync it, then os.replace() it over path (atomic on one filesystem)."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
 TRADES_CSV = config.DATA_DIR / "trades.csv"
 SIGNALS_CSV = config.DATA_DIR / "signals.csv"
 CANDIDATES_CSV = config.DATA_DIR / "candidates.csv"   # every setup that passed at a check, taken or not
@@ -138,7 +148,8 @@ class Trader:
 
     # ---------- state ----------
     def save(self):
-        STATE_FILE.write_text(json.dumps(self.state, indent=2, default=str))
+        """Crash-safe: write a temp file, then swap it in (a kill mid-write leaves the old state.json intact)."""
+        atomic_write(STATE_FILE, json.dumps(self.state, indent=2, default=str))
 
     def book(self, name):
         return self.state["books"][name]
@@ -515,7 +526,7 @@ class Trader:
             lines = TRADES_CSV.read_text().splitlines(keepends=True)
             if lines and "entry_spread_pct" not in lines[0]:
                 lines[0] = ",".join(TRADE_COLS) + "\n"     # add the trail / execution columns to the header
-                TRADES_CSV.write_text("".join(lines))
+                atomic_write(TRADES_CSV, "".join(lines))
         new = not TRADES_CSV.exists()
         with TRADES_CSV.open("a", newline="") as f:
             w = csv.writer(f)
